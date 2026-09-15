@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Database & Runtime Data
+data/*.db
+data/*.sqlite3
+*.db
+
+# Backups & Private files
+backups/
+logs/
+*.log
+
+# Temp & Excel runtime files
+*.xlsx
+!قالب اکسل پروژه.xlsx
+project_files/
+
+# OS files
+.DS_Store
+Thumbs.db

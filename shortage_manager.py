@@ -35,7 +35,7 @@ class ShortageManager:
         SELECT s.*, p.name as project_name 
         FROM shortages s
         JOIN projects p ON s.project_id = p.id
-        WHERE s.is_notified = 0 AND s.status = 'تامین نشده'
+        WHERE s.is_notified = 0 AND s.status = 'تامین نشده' AND p.status = 'ACTIVE'
         ''')
         rows = cursor.fetchall()
         conn.close()

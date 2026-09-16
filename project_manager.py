@@ -250,18 +250,23 @@ class ProjectManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM org_chart WHERE project_id = ?", (project_id,))
-        for unit, section in unit_section_pairs:
+        for idx, item in enumerate(unit_section_pairs, start=1):
+            if len(item) == 3:
+                unit, section, order_val = item
+            else:
+                unit, section = item
+                order_val = idx
             u = str(unit or '').strip()
             s = str(section or '').strip()
             if u and u not in ('None', ''):
-                cursor.execute("INSERT INTO org_chart (project_id, unit, section) VALUES (?, ?, ?)", (project_id, u, s))
+                cursor.execute("INSERT INTO org_chart (project_id, unit, section, display_order) VALUES (?, ?, ?, ?)", (project_id, u, s, int(order_val)))
         conn.commit()
         conn.close()
 
     def get_project_org_chart(self, project_id):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT unit, section FROM org_chart WHERE project_id = ? ORDER BY unit, section", (project_id,))
+        cursor.execute("SELECT unit, section, display_order FROM org_chart WHERE project_id = ? ORDER BY display_order ASC, id ASC", (project_id,))
         rows = cursor.fetchall()
         conn.close()
         chart = {}

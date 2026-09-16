@@ -2,6 +2,7 @@ import os
 import sys
 import importlib.abc
 import importlib.util
+import logging
 
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
@@ -31,10 +32,10 @@ class AttendanceManager:
     def create_schedule(self, project_id, name, day_of_week, time_str, location=""):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute("""
         INSERT INTO schedules (project_id, name, day_of_week, time_str, location, is_active)
         VALUES (?, ?, ?, ?, ?, 1)
-        ''', (project_id, name.strip(), day_of_week.strip(), time_str.strip(), location.strip()))
+        """, (project_id, name.strip(), day_of_week.strip(), time_str.strip(), location.strip()))
         schedule_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -50,57 +51,71 @@ class AttendanceManager:
 
     def create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
                        schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
-        '''
+        """
         Creates a session.
-        If copy_from_prev_session=True:
-           Copies the previous session's staff roster into the new session.
-        If sync_excel_sheet=True:
-           Creates a new worksheet in the project Excel file with previous day's staff.
-        '''
+        If schedule_id is provided, checks previous sessions specifically for that schedule.
+        Takes an immutable operational snapshot of the eligible active roster at session creation.
+        """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         
-        # 1. Find previous session before creating new one
-        cursor.execute("SELECT id FROM sessions WHERE project_id = ? ORDER BY id DESC LIMIT 1", (project_id,))
+        # 1. Look up previous session for this schedule if specified, else for the project
+        if schedule_id:
+            cursor.execute("""
+            SELECT id FROM sessions 
+            WHERE project_id = ? AND schedule_id = ? 
+            ORDER BY session_date DESC, id DESC LIMIT 1
+            """, (project_id, schedule_id))
+        else:
+            cursor.execute("""
+            SELECT id FROM sessions 
+            WHERE project_id = ? 
+            ORDER BY session_date DESC, id DESC LIMIT 1
+            """, (project_id,))
         prev_row = cursor.fetchone()
         prev_sid = prev_row['id'] if prev_row else None
 
         now_iso = datetime.now().isoformat()
         date_str = session_date or datetime.now().strftime("%Y-%m-%d")
 
-        cursor.execute('''
+        cursor.execute("""
         INSERT INTO sessions (project_id, schedule_id, name, session_date, time_str, day_of_week, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'SCHEDULED', ?)
-        ''', (project_id, schedule_id, name.strip(), date_str, str(time_str or '').strip(), str(day_of_week or '').strip(), now_iso))
+        """, (project_id, schedule_id, name.strip(), date_str, str(time_str or '').strip(), str(day_of_week or '').strip(), now_iso))
         session_id = cursor.lastrowid
         conn.commit()
 
-        # 2. Copy staff from previous session into new session attendance
-        if copy_from_prev_session:
-            if prev_sid:
-                cursor.execute("SELECT staff_id FROM attendance WHERE session_id = ?", (prev_sid,))
-                prev_staff = cursor.fetchall()
-                for r in prev_staff:
-                    cursor.execute('''
-                    INSERT INTO attendance (project_id, session_id, staff_id, status, card_status, updated_at)
-                    VALUES (?, ?, ?, '', '', ?)
-                    ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
-                    ''', (project_id, session_id, r['staff_id'], now_iso))
-            else:
-                # If first session, add all active project staff
-                cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND is_active = 1", (project_id,))
-                all_staff = cursor.fetchall()
-                for r in all_staff:
-                    cursor.execute('''
-                    INSERT INTO attendance (project_id, session_id, staff_id, status, card_status, updated_at)
-                    VALUES (?, ?, ?, '', '', ?)
-                    ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
-                    ''', (project_id, session_id, r['id'], now_iso))
-            conn.commit()
+        # 2. Populate session roster with staff lifecycle check and historical snapshot
+        # Eligible staff are active staff for this project whose start_session_id <= session_id (or NULL)
+        # and end_session_id >= session_id (or NULL)
+        cursor.execute("""
+        SELECT id, name, unit, section, position, gender 
+        FROM project_staff 
+        WHERE project_id = ? AND is_active = 1
+          AND (start_session_id IS NULL OR start_session_id <= ?)
+          AND (end_session_id IS NULL OR end_session_id >= ?)
+        ORDER BY id ASC
+        """, (project_id, session_id, session_id))
+        eligible_staff = cursor.fetchall()
 
+        for s in eligible_staff:
+            cursor.execute("""
+            INSERT INTO attendance (
+                project_id, session_id, staff_id, status, card_status,
+                staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                updated_at
+            )
+            VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
+            """, (
+                project_id, session_id, s['id'],
+                s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                now_iso
+            ))
+        conn.commit()
         conn.close()
 
-        # 3. Synchronize Excel sheet
+        # 3. Synchronize Excel sheet if requested
         if sync_excel_sheet:
             try:
                 from excel_manager import excel_manager
@@ -126,13 +141,18 @@ class AttendanceManager:
         conn.close()
         return dict(row) if row else None
 
-    def list_sessions(self, project_id, include_cancelled=False):
+    def list_sessions(self, project_id, schedule_id=None, include_cancelled=False):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        if include_cancelled:
-            cursor.execute("SELECT * FROM sessions WHERE project_id = ? ORDER BY id ASC", (project_id,))
-        else:
-            cursor.execute("SELECT * FROM sessions WHERE project_id = ? AND status != 'CANCELLED' ORDER BY id ASC", (project_id,))
+        query = "SELECT * FROM sessions WHERE project_id = ?"
+        params = [project_id]
+        if schedule_id is not None:
+            query += " AND schedule_id = ?"
+            params.append(schedule_id)
+        if not include_cancelled:
+            query += " AND status != 'CANCELLED'"
+        query += " ORDER BY id ASC"
+        cursor.execute(query, params)
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -159,24 +179,68 @@ class AttendanceManager:
         return self.update_session_field(session_id, 'status', 'CANCELLED')
 
     def get_session_attendance(self, project_id, session_id):
+        """
+        Retrieves attendance with historical snapshots preserved.
+        If a session has no attendance rows yet (legacy session), automatically seeds them.
+        """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+
+        # Check if attendance rows exist for this session
+        cursor.execute("SELECT COUNT(*) FROM attendance WHERE project_id = ? AND session_id = ?", (project_id, session_id))
+        cnt_row = cursor.fetchone()
+        if not cnt_row or cnt_row[0] == 0:
+            # Auto-seed attendance for this session
+            now_iso = datetime.now().isoformat()
+            cursor.execute("""
+            SELECT id, name, unit, section, position, gender 
+            FROM project_staff 
+            WHERE project_id = ? AND is_active = 1
+              AND (start_session_id IS NULL OR start_session_id <= ?)
+              AND (end_session_id IS NULL OR end_session_id >= ?)
+            ORDER BY id ASC
+            """, (project_id, session_id, session_id))
+            eligible_staff = cursor.fetchall()
+            for s in eligible_staff:
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, status, card_status,
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    updated_at
+                )
+                VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
+                """, (
+                    project_id, session_id, s['id'],
+                    s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                    now_iso
+                ))
+            conn.commit()
+
+        cursor.execute("""
         SELECT 
-            s.id as staff_id, s.project_id, s.name, s.phone, s.unit, s.section,
-            s.position, s.card_title, s.shift_time, s.gender, s.notes as staff_notes,
-            s.is_multi_section, s._excel_row,
+            s.id as staff_id, s.project_id, 
+            COALESCE(NULLIF(a.staff_name_snapshot, ''), s.name) as name,
+            s.phone, 
+            COALESCE(NULLIF(a.unit_snapshot, ''), s.unit) as unit,
+            COALESCE(NULLIF(a.section_snapshot, ''), s.section) as section,
+            COALESCE(NULLIF(a.position_snapshot, ''), s.position) as position,
+            s.card_title, s.shift_time, 
+            COALESCE(NULLIF(a.gender_snapshot, ''), s.gender) as gender,
+            s.notes as staff_notes,
+            s.is_multi_section, s._excel_row, s.staff_code,
+            s.start_session_id, s.end_session_id,
             COALESCE(a.id, 0) as attendance_id,
             COALESCE(a.status, '') as status,
             COALESCE(a.card_status, '') as card_status,
             COALESCE(a.late_tracking, '') as late_tracking,
             COALESCE(a.description, '') as description,
             a.updated_at
-        FROM project_staff s
-        LEFT JOIN attendance a ON s.id = a.staff_id AND a.session_id = ?
-        WHERE s.project_id = ? AND s.is_active = 1
+        FROM attendance a
+        JOIN project_staff s ON a.staff_id = s.id
+        WHERE a.project_id = ? AND a.session_id = ?
         ORDER BY s.id ASC
-        ''', (session_id, project_id))
+        """, (project_id, session_id))
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -184,24 +248,39 @@ class AttendanceManager:
     def get_staff_session_attendance(self, project_id, session_id, staff_id):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute("""
         SELECT 
-            s.id as staff_id, s.project_id, s.name, s.phone, s.unit, s.section,
-            s.position, s.card_title, s.shift_time, s.gender, s.notes as staff_notes,
-            s.is_multi_section, s._excel_row,
+            s.id as staff_id, s.project_id, 
+            COALESCE(NULLIF(a.staff_name_snapshot, ''), s.name) as name,
+            s.phone, 
+            COALESCE(NULLIF(a.unit_snapshot, ''), s.unit) as unit,
+            COALESCE(NULLIF(a.section_snapshot, ''), s.section) as section,
+            COALESCE(NULLIF(a.position_snapshot, ''), s.position) as position,
+            s.card_title, s.shift_time, 
+            COALESCE(NULLIF(a.gender_snapshot, ''), s.gender) as gender,
+            s.notes as staff_notes,
+            s.is_multi_section, s._excel_row, s.staff_code,
+            s.start_session_id, s.end_session_id,
             COALESCE(a.status, '') as status,
             COALESCE(a.card_status, '') as card_status,
             COALESCE(a.late_tracking, '') as late_tracking,
             COALESCE(a.description, '') as description
-        FROM project_staff s
-        LEFT JOIN attendance a ON s.id = a.staff_id AND a.session_id = ?
-        WHERE s.id = ? AND s.project_id = ?
-        ''', (session_id, staff_id, project_id))
+        FROM attendance a
+        JOIN project_staff s ON a.staff_id = s.id
+        WHERE a.project_id = ? AND a.session_id = ? AND a.staff_id = ?
+        """, (project_id, session_id, staff_id))
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
 
-    def update_attendance_status(self, project_id, session_id, staff_id, status_val, sync_same_phone=True):
+    def update_attendance_status(self, project_id, session_id, staff_id, status_val, actor_user_id=None, sync_same_phone=True):
+        if actor_user_id is not None:
+            from permission_manager import permission_manager
+            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            if not allowed:
+                logging.warning(f"update_attendance_status denied for actor {actor_user_id} on staff {staff_id}: {reason}")
+                return False
+
         staff = staff_manager.get_staff_member(staff_id)
         if not staff:
             return False
@@ -219,21 +298,42 @@ class AttendanceManager:
         now_iso = datetime.now().isoformat()
         try:
             for s_id in target_staff_ids:
-                cursor.execute('''
-                INSERT INTO attendance (project_id, session_id, staff_id, status, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                s_rec = staff_manager.get_staff_member(s_id)
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, status, 
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot, 
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
                     status = excluded.status,
                     updated_at = excluded.updated_at
-                ''', (project_id, session_id, s_id, status_val, now_iso))
+                """, (
+                    project_id, session_id, s_id, status_val,
+                    s_rec['name'] if s_rec else '',
+                    s_rec['unit'] if s_rec else '',
+                    s_rec['section'] if s_rec else '',
+                    s_rec['position'] if s_rec else '',
+                    s_rec['gender'] if s_rec else '',
+                    now_iso
+                ))
             conn.commit()
             return True
-        except Exception:
+        except Exception as e:
+            logging.error(f"update_attendance_status error: {e}")
             return False
         finally:
             conn.close()
 
-    def update_card_status(self, project_id, session_id, staff_id, card_val, sync_same_phone=True):
+    def update_card_status(self, project_id, session_id, staff_id, card_val, actor_user_id=None, sync_same_phone=True):
+        if actor_user_id is not None:
+            from permission_manager import permission_manager
+            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            if not allowed:
+                logging.warning(f"update_card_status denied for actor {actor_user_id} on staff {staff_id}: {reason}")
+                return False
+
         staff = staff_manager.get_staff_member(staff_id)
         if not staff:
             return False
@@ -248,21 +348,42 @@ class AttendanceManager:
         now_iso = datetime.now().isoformat()
         try:
             for s_id in target_staff_ids:
-                cursor.execute('''
-                INSERT INTO attendance (project_id, session_id, staff_id, card_status, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                s_rec = staff_manager.get_staff_member(s_id)
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, card_status,
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
                     card_status = excluded.card_status,
                     updated_at = excluded.updated_at
-                ''', (project_id, session_id, s_id, card_val, now_iso))
+                """, (
+                    project_id, session_id, s_id, card_val,
+                    s_rec['name'] if s_rec else '',
+                    s_rec['unit'] if s_rec else '',
+                    s_rec['section'] if s_rec else '',
+                    s_rec['position'] if s_rec else '',
+                    s_rec['gender'] if s_rec else '',
+                    now_iso
+                ))
             conn.commit()
             return True
-        except Exception:
+        except Exception as e:
+            logging.error(f"update_card_status error: {e}")
             return False
         finally:
             conn.close()
 
-    def add_late_tracking(self, project_id, session_id, staff_id, note):
+    def add_late_tracking(self, project_id, session_id, staff_id, note, actor_user_id=None):
+        if actor_user_id is not None:
+            from permission_manager import permission_manager
+            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            if not allowed:
+                logging.warning(f"add_late_tracking denied for actor {actor_user_id} on staff {staff_id}: {reason}")
+                return False
+
         record = self.get_staff_session_attendance(project_id, session_id, staff_id)
         if not record:
             return False
@@ -275,13 +396,11 @@ class AttendanceManager:
         cursor = conn.cursor()
         now_iso = datetime.now().isoformat()
         try:
-            cursor.execute('''
-            INSERT INTO attendance (project_id, session_id, staff_id, late_tracking, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                late_tracking = excluded.late_tracking,
-                updated_at = excluded.updated_at
-            ''', (project_id, session_id, staff_id, final_note, now_iso))
+            cursor.execute("""
+            UPDATE attendance 
+            SET late_tracking = ?, updated_at = ?
+            WHERE project_id = ? AND session_id = ? AND staff_id = ?
+            """, (final_note, now_iso, project_id, session_id, staff_id))
             conn.commit()
             return True
         except Exception:
@@ -289,7 +408,14 @@ class AttendanceManager:
         finally:
             conn.close()
 
-    def add_description(self, project_id, session_id, staff_id, note):
+    def add_description(self, project_id, session_id, staff_id, note, actor_user_id=None):
+        if actor_user_id is not None:
+            from permission_manager import permission_manager
+            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            if not allowed:
+                logging.warning(f"add_description denied for actor {actor_user_id} on staff {staff_id}: {reason}")
+                return False
+
         record = self.get_staff_session_attendance(project_id, session_id, staff_id)
         if not record:
             return False
@@ -302,13 +428,11 @@ class AttendanceManager:
         cursor = conn.cursor()
         now_iso = datetime.now().isoformat()
         try:
-            cursor.execute('''
-            INSERT INTO attendance (project_id, session_id, staff_id, description, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                description = excluded.description,
-                updated_at = excluded.updated_at
-            ''', (project_id, session_id, staff_id, final_desc, now_iso))
+            cursor.execute("""
+            UPDATE attendance 
+            SET description = ?, updated_at = ?
+            WHERE project_id = ? AND session_id = ? AND staff_id = ?
+            """, (final_desc, now_iso, project_id, session_id, staff_id))
             conn.commit()
             return True
         except Exception:
@@ -342,13 +466,11 @@ class AttendanceManager:
         for u in all_att:
             status = str(u.get("status", "")).strip()
             if not status or status == "None":
-                cursor.execute('''
-                INSERT INTO attendance (project_id, session_id, staff_id, status, updated_at)
-                VALUES (?, ?, ?, 'غایب', ?)
-                ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                    status = 'غایب',
-                    updated_at = excluded.updated_at
-                ''', (project_id, session_id, u["staff_id"], now_iso))
+                cursor.execute("""
+                UPDATE attendance
+                SET status = 'غایب', updated_at = ?
+                WHERE project_id = ? AND session_id = ? AND staff_id = ?
+                """, (now_iso, project_id, session_id, u["staff_id"]))
                 updated_count += 1
         conn.commit()
         conn.close()

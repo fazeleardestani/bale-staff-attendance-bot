@@ -5,6 +5,7 @@ __pycache__/
 venv/
 env/
 .env
+.env.example
 
 # Database & Runtime Data
 data/*.db

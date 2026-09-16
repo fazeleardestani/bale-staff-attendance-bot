@@ -349,5 +349,80 @@ class PermissionManager:
                 conn.close()
         self.set_project_user(project_id, user_id, role='unit_head', gender=gender, assigned_unit=assigned_unit, is_active=1)
 
-permission_manager = PermissionManager()
 
+    def check_staff_access(self, project_id, user_id, staff_id):
+        """Validates whether user_id is authorized to view or edit staff_id within project_id.
+        Returns: (allowed: bool, reason: str, role: str)
+        """
+        user = self.get_user(user_id)
+        if not user or not user.get('is_active', 1):
+            return False, "کاربر غیرفعال است", None
+        if user.get('is_global_super_admin', 0):
+            return True, "دسترسی مدیر ارشد کل", 'super_admin'
+
+        role, actor_gender, _, is_active, assigned_unit = self.get_user_project_role(project_id, user_id)
+        if not is_active or not role:
+            return False, "کاربر عضو این پروژه نیست", None
+
+        if role in ('super_admin', 'admin'):
+            return True, "دسترسی مدیر پروژه", role
+
+        from staff_manager import staff_manager
+        staff = staff_manager.get_staff_member(staff_id)
+        if not staff or staff.get('project_id') != project_id:
+            return False, "نیرو متعلق به این پروژه نیست", role
+
+        staff_gender = str(staff.get('gender', '')).strip()
+        staff_unit = str(staff.get('unit', '')).strip()
+
+        if role == 'unit_head':
+            if assigned_unit and staff_unit != assigned_unit:
+                return False, f"دسترسی محدود به واحد {assigned_unit}", role
+            return True, "دسترسی مسئول واحد", role
+
+        if role in ('operator', 'user'):
+            if actor_gender and staff_gender and actor_gender != staff_gender:
+                return False, f"عدم تطابق جنسیت با کادر ({actor_gender})", role
+            return True, "دسترسی اپراتور", role
+
+        return False, "عدم دسترسی", None
+
+    def record_operator_daily_absence(self, project_id, user_id, absent_date=None):
+        dt = absent_date or datetime.now().strftime("%Y-%m-%d")
+        now_iso = datetime.now().isoformat()
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO operator_daily_absence (project_id, user_id, absent_date, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project_id, user_id, absent_date) DO NOTHING
+        """, (project_id, user_id, dt, now_iso))
+        conn.commit()
+        conn.close()
+        return True
+
+    def clear_operator_daily_absence(self, project_id, user_id, absent_date=None):
+        dt = absent_date or datetime.now().strftime("%Y-%m-%d")
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        DELETE FROM operator_daily_absence
+        WHERE project_id = ? AND user_id = ? AND absent_date = ?
+        """, (project_id, user_id, dt))
+        conn.commit()
+        conn.close()
+        return True
+
+    def is_operator_absent_today(self, project_id, user_id, date_str=None):
+        dt = date_str or datetime.now().strftime("%Y-%m-%d")
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT 1 FROM operator_daily_absence
+        WHERE project_id = ? AND user_id = ? AND absent_date = ?
+        """, (project_id, user_id, dt))
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row)
+
+permission_manager = PermissionManager()

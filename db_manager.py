@@ -25,31 +25,46 @@ except ImportError:
     PYMYSQL_AVAILABLE = False
     logging.warning("pymysql is not installed. Remote MySQL sync will be skipped.")
 
+class DatabaseUnavailableError(Exception):
+    """Raised when the primary database cannot be reached or locked."""
+    pass
+
 class DatabaseManager:
+    CURRENT_SCHEMA_VERSION = 6
+
     def __init__(self, db_path=DEFAULT_SQLITE_PATH):
         self.db_path = db_path
         self.active_db_path = db_path
         self.lock = threading.Lock()
+        self._init_db_path()
         self.setup_database()
 
-    def get_sqlite_connection(self):
+    def _init_db_path(self):
+        """Tests if db_path is on a lock-supporting filesystem, else uses safe dedicated fallback."""
         try:
-            conn = sqlite3.connect(self.active_db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("CREATE TABLE IF NOT EXISTS _lock_check (id INT)")
-            return conn
+            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+            test_conn = sqlite3.connect(self.db_path, timeout=5.0)
+            test_conn.execute("PRAGMA foreign_keys = ON")
+            test_conn.execute("CREATE TABLE IF NOT EXISTS _lock_check (id INT)")
+            test_conn.close()
+            self.active_db_path = self.db_path
         except sqlite3.OperationalError as e:
             if "disk I/O error" in str(e) or "locking" in str(e):
                 fallback_path = os.path.join("/tmp", os.path.basename(self.db_path))
-                logging.warning(f"File locking failed on {self.active_db_path}. Falling back to {fallback_path}")
+                logging.warning(f"File locking unsupported on {self.db_path}. Initialized at {fallback_path}")
                 self.active_db_path = fallback_path
-                conn = sqlite3.connect(self.active_db_path, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute("CREATE TABLE IF NOT EXISTS _lock_check (id INT)")
-                return conn
-            raise
+            else:
+                raise
+
+    def get_sqlite_connection(self):
+        try:
+            conn = sqlite3.connect(self.active_db_path, timeout=30.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database connection error: {e}")
+            raise DatabaseUnavailableError(f"Database unavailable: {e}")
 
     def get_mysql_connection(self):
         if not MYSQL_ENABLED or not PYMYSQL_AVAILABLE:
@@ -70,8 +85,16 @@ class DatabaseManager:
             conn = self.get_sqlite_connection()
             cursor = conn.cursor()
 
+            # Schema version control table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                version INTEGER PRIMARY KEY,
+                updated_at TEXT
+            )
+            """)
+
             # 1. Global users table (Identity & Profile)
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 staff_name TEXT NOT NULL,
@@ -81,10 +104,10 @@ class DatabaseManager:
                 is_hr_member BOOLEAN DEFAULT 1,
                 created_at TEXT
             )
-            ''')
+            """)
 
             # 2. Projects table (Lifecycle: DRAFT, ACTIVE, COMPLETED, ARCHIVED)
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
@@ -101,24 +124,10 @@ class DatabaseManager:
                 created_at TEXT,
                 updated_at TEXT
             )
-            ''')
-
-            # Migrations for existing projects table
-            for col, col_type in [
-                ("total_sessions", "INTEGER DEFAULT 0"),
-                ("recurring_days", "TEXT DEFAULT ''"),
-                ("activation_time", "TEXT DEFAULT ''"),
-                ("start_date", "TEXT DEFAULT ''"),
-                ("end_date", "TEXT DEFAULT ''"),
-                ("has_prep_day", "BOOLEAN DEFAULT 0")
-            ]:
-                try:
-                    cursor.execute(f"ALTER TABLE projects ADD COLUMN {col} {col_type}")
-                except Exception:
-                    pass
+            """)
 
             # 3. Project Membership & Roles (Project-scoped permissions)
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS project_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -132,21 +141,22 @@ class DatabaseManager:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
-            # 4. Project Organizational Chart (Scoped to project)
-            cursor.execute('''
+            # 4. Project Organizational Chart (Scoped to project with display order)
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS org_chart (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
                 unit TEXT NOT NULL,
                 section TEXT NOT NULL,
+                display_order INTEGER DEFAULT 0,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
             # 5. Recurring Schedules for Classes
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS schedules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -157,10 +167,10 @@ class DatabaseManager:
                 is_active BOOLEAN DEFAULT 1,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
             # 6. Actual Calendar Sessions
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -174,22 +184,14 @@ class DatabaseManager:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(schedule_id) REFERENCES schedules(id) ON DELETE SET NULL
             )
-            ''')
+            """)
 
-            for col, col_type in [
-                ("time_str", "TEXT DEFAULT ''"),
-                ("day_of_week", "TEXT DEFAULT ''")
-            ]:
-                try:
-                    cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
-                except Exception:
-                    pass
-
-            # 7. Project Staff
-            cursor.execute('''
+            # 7. Project Staff with staff_code and session lifecycle
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS project_staff (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
+                staff_code TEXT,
                 name TEXT NOT NULL,
                 phone TEXT,
                 unit TEXT,
@@ -201,13 +203,15 @@ class DatabaseManager:
                 is_active BOOLEAN DEFAULT 1,
                 notes TEXT,
                 is_multi_section TEXT DEFAULT 'خیر',
+                start_session_id INTEGER,
+                end_session_id INTEGER,
                 _excel_row INTEGER,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
-            # 8. Attendance
-            cursor.execute('''
+            # 8. Attendance with immutable historical snapshots
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -217,16 +221,21 @@ class DatabaseManager:
                 card_status TEXT DEFAULT '',
                 late_tracking TEXT DEFAULT '',
                 description TEXT DEFAULT '',
+                staff_name_snapshot TEXT,
+                unit_snapshot TEXT,
+                section_snapshot TEXT,
+                position_snapshot TEXT,
+                gender_snapshot TEXT,
                 updated_at TEXT,
                 UNIQUE(project_id, session_id, staff_id),
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
                 FOREIGN KEY(staff_id) REFERENCES project_staff(id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
             # 9. Shortages
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS shortages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
@@ -244,10 +253,10 @@ class DatabaseManager:
                 created_at TEXT,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             )
-            ''')
+            """)
 
             # 10. Staff Logs
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS staff_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER,
@@ -256,103 +265,46 @@ class DatabaseManager:
                 log_date TEXT NOT NULL,
                 created_at TEXT
             )
-            ''')
+            """)
 
             # 11. User Context
-            cursor.execute('''
+            cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_context (
                 user_id INTEGER PRIMARY KEY,
                 current_project_id INTEGER,
                 current_session_id INTEGER,
                 updated_at TEXT
             )
-            ''')
+            """)
 
-            # Comprehensive Schema Migrations for backward and forward compatibility
-            migrations = [
-                # users
-                ("users", "staff_name", "TEXT DEFAULT ''"),
-                ("users", "gender", "TEXT DEFAULT 'خانم'"),
-                ("users", "is_global_super_admin", "BOOLEAN DEFAULT 0"),
-                ("users", "is_active", "BOOLEAN DEFAULT 1"),
-                ("users", "is_hr_member", "BOOLEAN DEFAULT 1"),
-                ("users", "created_at", "TEXT"),
-                # projects
-                ("projects", "type", "TEXT DEFAULT 'عمومی'"),
-                ("projects", "description", "TEXT DEFAULT ''"),
-                ("projects", "status", "TEXT DEFAULT 'ACTIVE'"),
-                ("projects", "excel_path", "TEXT"),
-                ("projects", "total_sessions", "INTEGER DEFAULT 0"),
-                ("projects", "recurring_days", "TEXT DEFAULT ''"),
-                ("projects", "activation_time", "TEXT DEFAULT ''"),
-                ("projects", "start_date", "TEXT DEFAULT ''"),
-                ("projects", "end_date", "TEXT DEFAULT ''"),
-                ("projects", "has_prep_day", "BOOLEAN DEFAULT 0"),
-                ("projects", "created_at", "TEXT"),
-                ("projects", "updated_at", "TEXT"),
-                # project_users
-                ("project_users", "role", "TEXT DEFAULT 'user'"),
-                ("project_users", "gender", "TEXT DEFAULT 'خانم'"),
-                ("project_users", "is_active", "BOOLEAN DEFAULT 1"),
-                ("project_users", "assigned_unit", "TEXT"),
-                ("project_users", "created_at", "TEXT"),
-                # schedules
-                ("schedules", "day_of_week", "TEXT DEFAULT ''"),
-                ("schedules", "time_str", "TEXT DEFAULT ''"),
-                ("schedules", "location", "TEXT DEFAULT ''"),
-                ("schedules", "is_active", "BOOLEAN DEFAULT 1"),
-                # sessions
-                ("sessions", "schedule_id", "INTEGER"),
-                ("sessions", "session_date", "TEXT DEFAULT ''"),
-                ("sessions", "time_str", "TEXT DEFAULT ''"),
-                ("sessions", "day_of_week", "TEXT DEFAULT ''"),
-                ("sessions", "status", "TEXT DEFAULT 'SCHEDULED'"),
-                ("sessions", "created_at", "TEXT"),
-                # project_staff
-                ("project_staff", "phone", "TEXT DEFAULT ''"),
-                ("project_staff", "unit", "TEXT DEFAULT ''"),
-                ("project_staff", "section", "TEXT DEFAULT ''"),
-                ("project_staff", "position", "TEXT DEFAULT 'نیرو'"),
-                ("project_staff", "card_title", "TEXT DEFAULT ''"),
-                ("project_staff", "shift_time", "TEXT DEFAULT ''"),
-                ("project_staff", "gender", "TEXT DEFAULT ''"),
-                ("project_staff", "is_active", "BOOLEAN DEFAULT 1"),
-                ("project_staff", "notes", "TEXT DEFAULT ''"),
-                ("project_staff", "is_multi_section", "TEXT DEFAULT 'خیر'"),
-                ("project_staff", "_excel_row", "INTEGER"),
-                # attendance
-                ("attendance", "status", "TEXT DEFAULT ''"),
-                ("attendance", "card_status", "TEXT DEFAULT ''"),
-                ("attendance", "late_tracking", "TEXT DEFAULT ''"),
-                ("attendance", "description", "TEXT DEFAULT ''"),
-                ("attendance", "updated_at", "TEXT"),
-                # shortages
-                ("shortages", "count", "INTEGER DEFAULT 1"),
-                ("shortages", "target_group", "TEXT DEFAULT 'عمومی'"),
-                ("shortages", "description", "TEXT DEFAULT ''"),
-                ("shortages", "status", "TEXT DEFAULT 'تامین نشده'"),
-                ("shortages", "assigned_name", "TEXT"),
-                ("shortages", "phone", "TEXT"),
-                ("shortages", "is_notified", "INTEGER DEFAULT 0"),
-                ("shortages", "requested_by", "INTEGER"),
-                ("shortages", "_excel_row", "INTEGER"),
-                ("shortages", "created_at", "TEXT")
-            ]
-            for tbl, col, col_def in migrations:
-                try:
-                    cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
-                except Exception:
-                    pass
+            # 12. Operator Daily Absence
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS operator_daily_absence (
+                project_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                absent_date TEXT NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY(project_id, user_id, absent_date),
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """)
+
+            # Execute explicit schema migrations
+            self._apply_migrations(cursor)
 
             # High-performance indexes
             indexes = [
                 ("idx_staff_project_active", "project_staff (project_id, is_active)"),
                 ("idx_staff_project_phone", "project_staff (project_id, phone)"),
+                ("idx_staff_code", "project_staff (project_id, staff_code)"),
                 ("idx_attendance_lookup", "attendance (project_id, session_id, staff_id)"),
                 ("idx_sessions_project", "sessions (project_id)"),
+                ("idx_sessions_sched_date", "sessions (project_id, schedule_id, session_date)"),
                 ("idx_shortages_project", "shortages (project_id, status)"),
                 ("idx_project_users_uid", "project_users (user_id)"),
-                ("idx_staff_logs_date", "staff_logs (log_date, project_id)")
+                ("idx_staff_logs_date", "staff_logs (log_date, project_id)"),
+                ("idx_org_chart_order", "org_chart (project_id, display_order)")
             ]
             for idx_name, idx_def in indexes:
                 try:
@@ -363,25 +315,137 @@ class DatabaseManager:
             # Seed default global super admins
             now_iso = datetime.now().isoformat()
             for uid in SUPER_ADMINS:
-                cursor.execute('''
+                cursor.execute("""
                 INSERT INTO users (user_id, staff_name, gender, is_global_super_admin, is_active, created_at)
                 VALUES (?, ?, 'خانم', 1, 1, ?)
                 ON CONFLICT(user_id) DO UPDATE SET is_global_super_admin=1, is_active=1
-                ''', (uid, f"مدیر ارشد {uid}", now_iso))
+                """, (uid, f"مدیر ارشد {uid}", now_iso))
 
             conn.commit()
             conn.close()
 
+    def _apply_migrations(self, cursor):
+        """Runs explicit migrations and tracks schema version."""
+        cursor.execute("SELECT MAX(version) FROM schema_meta")
+        row = cursor.fetchone()
+        current_v = row[0] if (row and row[0] is not None) else 0
+
+        now_iso = datetime.now().isoformat()
+
+        all_col_migrations = [
+            # v1 -> basic cols
+            ("users", "staff_name", "TEXT DEFAULT ''"),
+            ("users", "gender", "TEXT DEFAULT 'خانم'"),
+            ("users", "is_global_super_admin", "BOOLEAN DEFAULT 0"),
+            ("users", "is_active", "BOOLEAN DEFAULT 1"),
+            ("users", "is_hr_member", "BOOLEAN DEFAULT 1"),
+            ("users", "created_at", "TEXT"),
+            ("projects", "type", "TEXT DEFAULT 'عمومی'"),
+            ("projects", "description", "TEXT DEFAULT ''"),
+            ("projects", "status", "TEXT DEFAULT 'ACTIVE'"),
+            ("projects", "excel_path", "TEXT"),
+            ("projects", "total_sessions", "INTEGER DEFAULT 0"),
+            ("projects", "recurring_days", "TEXT DEFAULT ''"),
+            ("projects", "activation_time", "TEXT DEFAULT ''"),
+            ("projects", "start_date", "TEXT DEFAULT ''"),
+            ("projects", "end_date", "TEXT DEFAULT ''"),
+            ("projects", "has_prep_day", "BOOLEAN DEFAULT 0"),
+            ("projects", "created_at", "TEXT"),
+            ("projects", "updated_at", "TEXT"),
+            ("project_users", "role", "TEXT DEFAULT 'user'"),
+            ("project_users", "gender", "TEXT DEFAULT 'خانم'"),
+            ("project_users", "is_active", "BOOLEAN DEFAULT 1"),
+            ("project_users", "assigned_unit", "TEXT"),
+            ("project_users", "created_at", "TEXT"),
+            ("sessions", "schedule_id", "INTEGER"),
+            ("sessions", "session_date", "TEXT DEFAULT ''"),
+            ("sessions", "time_str", "TEXT DEFAULT ''"),
+            ("sessions", "day_of_week", "TEXT DEFAULT ''"),
+            ("sessions", "status", "TEXT DEFAULT 'SCHEDULED'"),
+            ("sessions", "created_at", "TEXT"),
+            ("project_staff", "phone", "TEXT DEFAULT ''"),
+            ("project_staff", "unit", "TEXT DEFAULT ''"),
+            ("project_staff", "section", "TEXT DEFAULT ''"),
+            ("project_staff", "position", "TEXT DEFAULT 'نیرو'"),
+            ("project_staff", "card_title", "TEXT DEFAULT ''"),
+            ("project_staff", "shift_time", "TEXT DEFAULT ''"),
+            ("project_staff", "gender", "TEXT DEFAULT ''"),
+            ("project_staff", "is_active", "BOOLEAN DEFAULT 1"),
+            ("project_staff", "notes", "TEXT DEFAULT ''"),
+            ("project_staff", "is_multi_section", "TEXT DEFAULT 'خیر'"),
+            ("project_staff", "_excel_row", "INTEGER"),
+            # v2 -> shortage enhancements
+            ("shortages", "count", "INTEGER DEFAULT 1"),
+            ("shortages", "target_group", "TEXT DEFAULT 'عمومی'"),
+            ("shortages", "description", "TEXT DEFAULT ''"),
+            ("shortages", "status", "TEXT DEFAULT 'تامین نشده'"),
+            ("shortages", "assigned_name", "TEXT"),
+            ("shortages", "phone", "TEXT"),
+            ("shortages", "is_notified", "INTEGER DEFAULT 0"),
+            ("shortages", "requested_by", "INTEGER"),
+            ("shortages", "_excel_row", "INTEGER"),
+            ("shortages", "created_at", "TEXT"),
+            # v3 -> staff code & lifecycle
+            ("project_staff", "staff_code", "TEXT"),
+            ("project_staff", "start_session_id", "INTEGER"),
+            ("project_staff", "end_session_id", "INTEGER"),
+            # v4 -> attendance historical snapshots
+            ("attendance", "staff_name_snapshot", "TEXT"),
+            ("attendance", "unit_snapshot", "TEXT"),
+            ("attendance", "section_snapshot", "TEXT"),
+            ("attendance", "position_snapshot", "TEXT"),
+            ("attendance", "gender_snapshot", "TEXT"),
+            # v5 -> org chart display order
+            ("org_chart", "display_order", "INTEGER DEFAULT 0"),
+        ]
+
+        for tbl, col, col_def in all_col_migrations:
+            try:
+                cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
+        if current_v < self.CURRENT_SCHEMA_VERSION:
+            cursor.execute("""
+            INSERT OR REPLACE INTO schema_meta (version, updated_at)
+            VALUES (?, ?)
+            """, (self.CURRENT_SCHEMA_VERSION, now_iso))
+            logging.info(f"Database schema upgraded to version {self.CURRENT_SCHEMA_VERSION}")
+
     def backup_database(self, label="auto"):
+        """Safe SQLite online backup utilizing sqlite3.Connection.backup API with retention."""
         with self.lock:
             try:
                 if not os.path.exists(self.active_db_path):
                     return None
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                category_dir = os.path.join(DB_BACKUPS_DIR, label)
+                os.makedirs(category_dir, exist_ok=True)
                 backup_name = f"bot_cache_{label}_{timestamp}.db"
-                target_path = os.path.join(DB_BACKUPS_DIR, backup_name)
-                shutil.copy2(self.active_db_path, target_path)
-                logging.info(f"Database backup created: {target_path}")
+                target_path = os.path.join(category_dir, backup_name)
+
+                temp_target = os.path.join("/tmp", f"tmp_bkp_{timestamp}_{os.getpid()}.db")
+                source_conn = self.get_sqlite_connection()
+                dest_conn = sqlite3.connect(temp_target)
+                with dest_conn:
+                    source_conn.backup(dest_conn)
+                dest_conn.close()
+                source_conn.close()
+                shutil.move(temp_target, target_path)
+
+                # Retention policy: keep last 15 backups per category
+                try:
+                    files = sorted(
+                        [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".db")],
+                        key=os.path.getmtime
+                    )
+                    if len(files) > 15:
+                        for old_f in files[:-15]:
+                            os.remove(old_f)
+                except Exception:
+                    pass
+
+                logging.info(f"Database safe online backup created: {target_path}")
                 return target_path
             except Exception as e:
                 logging.error(f"Backup failed: {e}")

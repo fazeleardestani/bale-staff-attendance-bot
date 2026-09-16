@@ -7,20 +7,27 @@ class StaffManager:
     def __init__(self, db=db_instance):
         self.db = db
 
-    def add_staff_member(self, project_id, name, phone, unit, section, position='نیرو', 
+    def add_staff_member(self, project_id, name, phone="", unit="", section="", position='نیرو', 
                          card_title=None, shift_time='', gender='', notes='', 
-                         is_multi_section='خیر', excel_row=None):
+                         is_multi_section='خیر', excel_row=None, staff_code=None,
+                         start_session_id=None, end_session_id=None):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         c_title = card_title if card_title is not None else section
-        cursor.execute('''
+        cursor.execute("""
         INSERT INTO project_staff 
-        (project_id, name, phone, unit, section, position, card_title, shift_time, gender, is_active, notes, is_multi_section, _excel_row)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-        ''', (project_id, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
+        (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, is_active, notes, is_multi_section, start_session_id, end_session_id, _excel_row)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+        """, (project_id, staff_code, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
               position.strip(), str(c_title).strip(), str(shift_time or '').strip(), 
-              gender.strip(), notes.strip(), is_multi_section, excel_row))
+              gender.strip(), notes.strip(), is_multi_section, start_session_id, end_session_id, excel_row))
         staff_id = cursor.lastrowid
+
+        # If staff_code was not provided, auto-assign a deterministic code STF-<id:05d>
+        if not staff_code:
+            auto_code = f"STF-{staff_id:05d}"
+            cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
+
         conn.commit()
         conn.close()
         return staff_id
@@ -33,7 +40,17 @@ class StaffManager:
         conn.close()
         return dict(row) if row else None
 
-    def list_staff(self, project_id, unit=None, section=None, active_only=True):
+    def get_staff_by_code(self, project_id, staff_code):
+        if not staff_code:
+            return None
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, str(staff_code).strip()))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def list_staff(self, project_id, unit=None, section=None, session_id=None, active_only=True):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         query = "SELECT * FROM project_staff WHERE project_id = ?"
@@ -46,14 +63,17 @@ class StaffManager:
         if section:
             query += " AND section = ?"
             params.append(section)
+        if session_id is not None:
+            query += " AND (start_session_id IS NULL OR start_session_id <= ?) AND (end_session_id IS NULL OR end_session_id >= ?)"
+            params.extend([session_id, session_id])
         query += " ORDER BY id ASC"
         cursor.execute(query, params)
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
 
-    def search_staff(self, project_id, query_str, active_only=True):
-        all_staff = self.list_staff(project_id, active_only=active_only)
+    def search_staff(self, project_id, query_str, active_only=True, session_id=None):
+        all_staff = self.list_staff(project_id, active_only=active_only, session_id=session_id)
         clean_q = normalize_persian(query_str)
         if not clean_q:
             return all_staff
@@ -64,8 +84,10 @@ class StaffManager:
             unit_norm = normalize_persian(s.get('unit', ''))
             sec_norm = normalize_persian(s.get('section', ''))
             card_norm = normalize_persian(s.get('card_title', ''))
+            code_norm = normalize_persian(s.get('staff_code', ''))
             if (clean_q in name_norm or clean_q in phone_norm or 
-                clean_q in unit_norm or clean_q in sec_norm or clean_q in card_norm):
+                clean_q in unit_norm or clean_q in sec_norm or clean_q in card_norm or
+                clean_q in code_norm):
                 results.append(s)
         return results
 
@@ -84,7 +106,11 @@ class StaffManager:
         staff = self.get_staff_member(staff_id)
         if not staff:
             return False
-        allowed_fields = ['name', 'phone', 'unit', 'section', 'position', 'card_title', 'shift_time', 'gender', 'notes', 'is_active', 'is_multi_section', '_excel_row']
+        allowed_fields = [
+            'name', 'phone', 'unit', 'section', 'position', 'card_title', 
+            'shift_time', 'gender', 'notes', 'is_active', 'is_multi_section', 
+            'staff_code', 'start_session_id', 'end_session_id', '_excel_row'
+        ]
         if field_name not in allowed_fields:
             return False
         project_id = staff['project_id']
@@ -107,11 +133,11 @@ class StaffManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('''
+            cursor.execute("""
             UPDATE project_staff 
             SET shift_time = ? 
             WHERE project_id = ? AND unit = ? AND section = ?
-            ''', (new_time.strip(), project_id, unit.strip(), section.strip()))
+            """, (new_time.strip(), project_id, unit.strip(), section.strip()))
             conn.commit()
             return True
         except Exception:

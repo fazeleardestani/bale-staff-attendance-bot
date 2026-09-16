@@ -113,3 +113,18 @@ def format_delay_minutes(shift_time_str, now=None):
         return 0
     except Exception:
         return 0
+
+
+def get_persian_weekday(dt=None):
+    if dt is None:
+        dt = datetime.now()
+    mapping = {
+        5: "شنبه",
+        6: "یکشنبه",
+        0: "دوشنبه",
+        1: "سه‌شنبه",
+        2: "چهارشنبه",
+        3: "پنج‌شنبه",
+        4: "جمعه"
+    }
+    return mapping.get(dt.weekday(), "")

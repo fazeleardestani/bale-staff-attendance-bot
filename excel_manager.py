@@ -2,6 +2,7 @@ import os
 import sys
 import importlib.abc
 import importlib.util
+import logging
 
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
@@ -49,22 +50,32 @@ class ExcelManager:
 
         return default_target
 
-    def backup_project_excel(self, project_id):
+    def backup_project_excel(self, project_id, label="auto"):
         excel_path = self.get_project_excel_path(project_id)
         if os.path.exists(excel_path):
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            category_dir = os.path.join(EXCEL_BACKUPS_DIR, label)
+            os.makedirs(category_dir, exist_ok=True)
             backup_name = f"project_{project_id}_backup_{timestamp}.xlsx"
-            target_path = os.path.join(EXCEL_BACKUPS_DIR, backup_name)
+            target_path = os.path.join(category_dir, backup_name)
             shutil.copy2(excel_path, target_path)
+
+            # Retention policy: keep last 15 backups
+            try:
+                files = sorted(
+                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".xlsx")],
+                    key=os.path.getmtime
+                )
+                if len(files) > 15:
+                    for old_f in files[:-15]:
+                        os.remove(old_f)
+            except Exception:
+                pass
+
             return target_path
         return None
 
     def add_session_sheet(self, project_id, session_name):
-        '''
-        Creates a new worksheet for the new session in the project's Excel file.
-        Copies headers and staff roster from the previous session's sheet,
-        while clearing attendance, card, and late tracking columns for the new day.
-        '''
         excel_path = self.get_project_excel_path(project_id)
         if not os.path.exists(excel_path):
             return False
@@ -103,69 +114,80 @@ class ExcelManager:
         return True
 
     def import_project_excel(self, project_id, uploaded_file_path):
+        """
+        Transactional import of project Excel file.
+        1. Validates extension (rejects .xls).
+        2. Creates safety backups (database + excel).
+        3. Executes changes in a single SQLite transaction.
+        4. Rolls back completely on failure.
+        """
+        if uploaded_file_path.lower().endswith('.xls') and not uploaded_file_path.lower().endswith('.xlsx'):
+            raise ValueError("فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
+
         from attendance_manager import attendance_manager
 
-        self.backup_project_excel(project_id)
+        # Create safety pre-update backups
+        self.backup_project_excel(project_id, label="pre_update")
+        db_instance.backup_database(label="pre_update")
+
         proj_excel_path = self.get_project_excel_path(project_id)
-        if os.path.abspath(uploaded_file_path) != os.path.abspath(proj_excel_path): shutil.copy2(uploaded_file_path, proj_excel_path)
+        if os.path.abspath(uploaded_file_path) != os.path.abspath(proj_excel_path):
+            shutil.copy2(uploaded_file_path, proj_excel_path)
         project_manager.update_project_excel_path(project_id, proj_excel_path)
 
         wb = openpyxl.load_workbook(proj_excel_path, data_only=True)
         exclude_sheets = ['تامین نیرو', 'چارت', 'داشبورد']
         valid_sheets = [s for s in wb.sheetnames if s not in exclude_sheets]
 
-        # 1. Chart
-        if "چارت" in wb.sheetnames:
-            ws_chart = wb["چارت"]
-            pairs = []
-            for r in range(2, ws_chart.max_row + 1):
-                u = str(ws_chart.cell(row=r, column=1).value or "").strip()
-                s = str(ws_chart.cell(row=r, column=2).value or "").strip()
-                if u and u not in ("None", ""):
-                    pairs.append((u, s))
-            project_manager.set_project_org_chart(project_id, pairs)
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        now_iso = datetime.now().isoformat()
 
-        # 2. Shortages
-        if "تامین نیرو" in wb.sheetnames:
-            ws_sh = wb["تامین نیرو"]
-            conn = self.db.get_sqlite_connection()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM shortages WHERE project_id = ?", (project_id,))
-            now_iso = datetime.now().isoformat()
-            for r in range(2, ws_sh.max_row + 1):
-                u = str(ws_sh.cell(row=r, column=2).value or "").strip()
-                s = str(ws_sh.cell(row=r, column=3).value or "").strip()
-                st = str(ws_sh.cell(row=r, column=4).value or "").strip()
-                assigned_name = str(ws_sh.cell(row=r, column=5).value or "").strip()
-                phone = str(ws_sh.cell(row=r, column=6).value or "").strip()
-                desc = str(ws_sh.cell(row=r, column=7).value or "").strip()
-                target_grp = str(ws_sh.cell(row=r, column=8).value or "").strip()
-                if u and u not in ("None", ""):
-                    cursor.execute('''
-                    INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
-                    VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
-                    ''', (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
-            conn.commit()
-            conn.close()
+        try:
+            # 1. Organizational Chart with display order
+            if "چارت" in wb.sheetnames:
+                ws_chart = wb["چارت"]
+                pairs = []
+                for r in range(2, ws_chart.max_row + 1):
+                    u = str(ws_chart.cell(row=r, column=1).value or "").strip()
+                    s = str(ws_chart.cell(row=r, column=2).value or "").strip()
+                    if u and u not in ("None", ""):
+                        pairs.append((u, s, r - 1))
+                project_manager.set_project_org_chart(project_id, pairs)
 
-        # 3. Sessions & Staff
-        for sheet_name in valid_sheets:
-            session = attendance_manager.get_session_by_name(project_id, sheet_name)
-            if not session:
-                session_id = attendance_manager.create_session(project_id, sheet_name, copy_from_prev_session=False, sync_excel_sheet=False)
-            else:
-                session_id = session['id']
+            # 2. Shortages
+            if "تامین نیرو" in wb.sheetnames:
+                ws_sh = wb["تامین نیرو"]
+                cursor.execute("DELETE FROM shortages WHERE project_id = ?", (project_id,))
+                for r in range(2, ws_sh.max_row + 1):
+                    u = str(ws_sh.cell(row=r, column=2).value or "").strip()
+                    s = str(ws_sh.cell(row=r, column=3).value or "").strip()
+                    st = str(ws_sh.cell(row=r, column=4).value or "").strip()
+                    assigned_name = str(ws_sh.cell(row=r, column=5).value or "").strip()
+                    phone = str(ws_sh.cell(row=r, column=6).value or "").strip()
+                    desc = str(ws_sh.cell(row=r, column=7).value or "").strip()
+                    target_grp = str(ws_sh.cell(row=r, column=8).value or "").strip()
+                    if u and u not in ("None", ""):
+                        cursor.execute("""
+                        INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
+                        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
+                        """, (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
 
-            ws = wb[sheet_name]
-            header_map = {}
-            for c in range(1, 100):
-                val = ws.cell(row=1, column=c).value
-                if val:
-                    header_map[str(val).strip()] = c
+            # 3. Sessions & Staff
+            for sheet_name in valid_sheets:
+                session = attendance_manager.get_session_by_name(project_id, sheet_name)
+                if not session:
+                    session_id = attendance_manager.create_session(project_id, sheet_name, copy_from_prev_session=False, sync_excel_sheet=False)
+                else:
+                    session_id = session['id']
 
-            conn = self.db.get_sqlite_connection()
-            cursor = conn.cursor()
-            try:
+                ws = wb[sheet_name]
+                header_map = {}
+                for c in range(1, 100):
+                    val = ws.cell(row=1, column=c).value
+                    if val:
+                        header_map[str(val).strip()] = c
+
                 for r_idx in range(2, ws.max_row + 1):
                     def get_val(col_name):
                         c = header_map.get(col_name)
@@ -175,6 +197,7 @@ class ExcelManager:
 
                     name = get_val("نام و نام خانوادگی")
                     if not name: continue
+                    staff_code = get_val("کد پرسنلی") or get_val("کد نیرو") or get_val("شناسه نیرو")
                     unit = get_val("واحد")
                     section = get_val("بخش")
                     pos = get_val("سمت") or "نیرو"
@@ -188,14 +211,21 @@ class ExcelManager:
                     gender = get_val("جنسیت")
                     is_multi = get_val("فعال در چند بخش؟") or "خیر"
 
-                    cursor.execute('''
-                    SELECT id FROM project_staff WHERE project_id = ? AND name = ? AND unit = ? AND section = ?
-                    ''', (project_id, name, unit, section))
-                    staff_row = cursor.fetchone()
+                    # Stable identity: check staff_code first if available
+                    staff_row = None
+                    if staff_code:
+                        cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, staff_code))
+                        staff_row = cursor.fetchone()
+
+                    if not staff_row:
+                        cursor.execute("""
+                        SELECT id FROM project_staff WHERE project_id = ? AND name = ? AND unit = ? AND section = ?
+                        """, (project_id, name, unit, section))
+                        staff_row = cursor.fetchone()
 
                     if staff_row:
                         staff_id = staff_row['id']
-                        cursor.execute('''
+                        cursor.execute("""
                         UPDATE project_staff SET
                             phone = COALESCE(NULLIF(?, ''), phone),
                             shift_time = COALESCE(NULLIF(?, ''), shift_time),
@@ -204,30 +234,45 @@ class ExcelManager:
                             card_title = COALESCE(NULLIF(?, ''), card_title),
                             _excel_row = ?
                         WHERE id = ?
-                        ''', (phone, shift_time, gender, pos, card_title, r_idx, staff_id))
+                        """, (phone, shift_time, gender, pos, card_title, r_idx, staff_id))
                     else:
-                        cursor.execute('''
-                        INSERT INTO project_staff (project_id, name, phone, unit, section, position, card_title, shift_time, gender, notes, is_multi_section, _excel_row)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (project_id, name, phone, unit, section, pos, card_title, shift_time, gender, desc, is_multi, r_idx))
+                        cursor.execute("""
+                        INSERT INTO project_staff (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, notes, is_multi_section, _excel_row)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (project_id, staff_code, name, phone, unit, section, pos, card_title, shift_time, gender, desc, is_multi, r_idx))
                         staff_id = cursor.lastrowid
+                        if not staff_code:
+                            auto_code = f"STF-{staff_id:05d}"
+                            cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
 
-                    now_iso = datetime.now().isoformat()
-                    cursor.execute('''
-                    INSERT INTO attendance (project_id, session_id, staff_id, status, card_status, late_tracking, description, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    cursor.execute("""
+                    INSERT INTO attendance (
+                        project_id, session_id, staff_id, status, card_status, late_tracking, description,
+                        staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
                         status = excluded.status,
                         card_status = excluded.card_status,
                         late_tracking = excluded.late_tracking,
                         description = excluded.description,
                         updated_at = excluded.updated_at
-                    ''', (project_id, session_id, staff_id, att_st, card_st, late_trk, desc, now_iso))
-                conn.commit()
-            finally:
-                conn.close()
+                    """, (
+                        project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
+                        name, unit, section, pos, gender,
+                        now_iso
+                    ))
 
-        wb.close()
+            conn.commit()
+        except Exception as err:
+            conn.rollback()
+            logging.error(f"Excel import failed and was rolled back: {err}")
+            raise err
+        finally:
+            conn.close()
+            wb.close()
+
         return True
 
     def export_project_excel(self, project_id, output_path=None):
@@ -259,6 +304,7 @@ class ExcelManager:
                     rec['_excel_row'] = r_idx
 
                 if "نام و نام خانوادگی" in header_map: ws.cell(row=r_idx, column=header_map["نام و نام خانوادگی"]).value = rec.get("name")
+                if "کد پرسنلی" in header_map: ws.cell(row=r_idx, column=header_map["کد پرسنلی"]).value = rec.get("staff_code")
                 if "واحد" in header_map: ws.cell(row=r_idx, column=header_map["واحد"]).value = rec.get("unit")
                 if "بخش" in header_map: ws.cell(row=r_idx, column=header_map["بخش"]).value = rec.get("section")
                 if "سمت" in header_map: ws.cell(row=r_idx, column=header_map["سمت"]).value = rec.get("position")
@@ -294,10 +340,6 @@ class ExcelManager:
         return out_path
 
     def cleanup_sample_sheets(self, project_id, active_session_names):
-        '''
-        Removes example/sample sheets (like 'روز آماده سازی', 'روز 1', 'روز 2')
-        from the newly cloned project Excel file if they are not actual sessions of this project.
-        '''
         excel_path = self.get_project_excel_path(project_id)
         if not os.path.exists(excel_path):
             return False
@@ -316,4 +358,3 @@ class ExcelManager:
             return False
 
 excel_manager = ExcelManager()
-

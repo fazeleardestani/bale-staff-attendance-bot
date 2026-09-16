@@ -26,7 +26,7 @@ from config import (
     BALE_API_URL, BALE_FILE_URL, BOT_TOKEN, LOGS_DIR
 )
 from logger import logger, log_callback, log_message, log_action, log_error
-from db_manager import db_instance
+from db_manager import db_instance, DatabaseUnavailableError
 from utils import normalize_persian, safe_markdown, get_user_emojis, calculate_status_with_delay
 from permission_manager import permission_manager
 from project_manager import project_manager
@@ -272,6 +272,11 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
         types.InlineKeyboardButton("➕ افزودن نیروی جدید", callback_data="menu_add_user")
     )
 
+    if role in ("operator", "user"):
+        is_abs = permission_manager.is_operator_absent_today(project_id, chat_id)
+        abs_btn_text = "✅ اعلام حضور امروز" if is_abs else "🏖 ثبت عدم حضور امروز (مرخصی)"
+        markup.add(types.InlineKeyboardButton(abs_btn_text, callback_data="toggle_my_daily_absence"))
+
     if role in ("admin", "super_admin"):
         markup.add(
             types.InlineKeyboardButton("📊 داشبورد آماری (زنده)", callback_data="menu_dashboard"),
@@ -331,6 +336,17 @@ def handle_callbacks(call):
         # ==========================================
         # 1. Global / Project-Independent Callbacks
         # ==========================================
+        if data == "toggle_my_daily_absence":
+            is_abs = permission_manager.is_operator_absent_today(pid, chat_id)
+            if is_abs:
+                permission_manager.clear_operator_daily_absence(pid, chat_id)
+                bot.answer_callback_query(call.id, "✅ وضعیت شما به «حاضر امروز» تغییر یافت و یادآوری‌ها فعال شد.", show_alert=True)
+            else:
+                permission_manager.record_operator_daily_absence(pid, chat_id)
+                bot.answer_callback_query(call.id, "🏖 عدم حضور شما برای امروز ثبت شد. پیام‌های یادآوری امروز برای شما ارسال نخواهد شد.", show_alert=True)
+            show_project_menu(chat_id, pid, sid, call.message.message_id)
+            return
+
         if data == "menu_switch_project":
             permission_manager.set_user_context(chat_id, project_id=None, session_id=None)
             send_welcome(call.message)
@@ -929,11 +945,17 @@ def handle_callbacks(call):
             if val == "clear": val = ""
 
             if action_type == "status":
-                attendance_manager.update_attendance_status(pid, sid, staff_id, val)
+                ok = attendance_manager.update_attendance_status(pid, sid, staff_id, val, actor_user_id=chat_id)
+                if not ok:
+                    bot.answer_callback_query(call.id, "⚠️ شما اجازه تغییر وضعیت این نیرو را ندارید.", show_alert=True)
+                    return
                 report_manager.log_staff_action(pid, chat_id, 'attendance')
                 log_action(chat_id, pid, "Update Attendance", f"Staff: {staff_id}, Val: '{val}'")
             elif action_type == "card":
-                attendance_manager.update_card_status(pid, sid, staff_id, val)
+                ok = attendance_manager.update_card_status(pid, sid, staff_id, val, actor_user_id=chat_id)
+                if not ok:
+                    bot.answer_callback_query(call.id, "⚠️ شما اجازه تغییر وضعیت کارت این نیرو را ندارید.", show_alert=True)
+                    return
                 report_manager.log_staff_action(pid, chat_id, 'card')
                 log_action(chat_id, pid, "Update Card", f"Staff: {staff_id}, Val: '{val}'")
 
@@ -1917,7 +1939,10 @@ def process_track_late(message):
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'track_late': return
     pid = state['pid']; sid = state['sid']; staff_id = state['staff_id']
-    attendance_manager.add_late_tracking(pid, sid, staff_id, message.text)
+    ok = attendance_manager.add_late_tracking(pid, sid, staff_id, message.text, actor_user_id=chat_id)
+    if not ok:
+        bot.send_message(chat_id, "⚠️ شما اجازه ثبت پیگیری برای این نیرو را ندارید.")
+        return
     report_manager.log_staff_action(pid, chat_id, 'call')
     log_action(chat_id, pid, "Add Late Tracking", f"Staff: {staff_id}, Note: {message.text}")
     bot.send_message(chat_id, "✅ نتیجه پیگیری ثبت گردید.")
@@ -1930,7 +1955,10 @@ def process_edit_desc(message):
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'edit_desc': return
     pid = state['pid']; sid = state['sid']; staff_id = state['staff_id']
-    attendance_manager.add_description(pid, sid, staff_id, message.text)
+    ok = attendance_manager.add_description(pid, sid, staff_id, message.text, actor_user_id=chat_id)
+    if not ok:
+        bot.send_message(chat_id, "⚠️ شما اجازه ویرایش توضیحات این نیرو را ندارید.")
+        return
     log_action(chat_id, pid, "Edit Description", f"Staff: {staff_id}, Desc: {message.text}")
     bot.send_message(chat_id, "✅ توضیحات با موفقیت ثبت شد.")
     show_user_profile(chat_id, pid, sid, staff_id)
@@ -2214,14 +2242,18 @@ def process_update_excel_file(message, project_id):
         return
     fname = message.document.file_name
     log_message(chat_id, f"Uploaded document: {fname}", "process_update_excel_file")
-    if not (fname.endswith('.xlsx') or fname.endswith('.xls')):
-        bot.send_message(chat_id, "❌ فقط فایل‌های با فرمت xlsx یا xls مجاز هستند.")
+    if fname.lower().endswith('.xls') and not fname.lower().endswith('.xlsx'):
+        bot.send_message(chat_id, "⚠️ فرمت قدیمی `.xls` پشتیبانی نمی‌شود.\nلطفاً فایل را در نرم‌افزار اکسل با فرمت **.xlsx** ذخیره کرده و ارسال فرمایید.", parse_mode="Markdown")
+        return
+    if not fname.lower().endswith('.xlsx'):
+        bot.send_message(chat_id, "❌ فقط فایل‌های با فرمت .xlsx مجاز هستند.")
         return
     bot.send_message(chat_id, "⏳ در حال دریافت فایل اکسل و به‌روزرسانی اطلاعات پروژه...")
     try:
         f_info = bot.get_file(message.document.file_id)
         f_url = f"{BALE_FILE_URL.format(BOT_TOKEN, f_info.file_path)}"
-        resp = requests.get(f_url)
+        resp = requests.get(f_url, timeout=(10, 60))
+        resp.raise_for_status()
         temp_p = os.path.join(excel_manager.get_project_excel_path(project_id) + ".incoming")
         with open(temp_p, "wb") as f: f.write(resp.content)
         if excel_manager.import_project_excel(project_id, temp_p):
@@ -2232,9 +2264,15 @@ def process_update_excel_file(message, project_id):
         else:
             log_error(chat_id, f"Failed to validate excel file {fname}")
             bot.send_message(chat_id, "❌ خطا در اعتبارسنجی و خواندن اطلاعات اکسل.")
+    except requests.exceptions.Timeout:
+        bot.send_message(chat_id, "❌ مهلت دریافت فایل از سرور بله به پایان رسید (Timeout).\nلطفاً از اتصال اینترنت اطمینان حاصل کرده و مجدداً فایل را ارسال فرمایید.")
+    except requests.exceptions.RequestException as req_err:
+        bot.send_message(chat_id, f"❌ خطا در دانلود فایل از سرور پیام‌رسان بله: {req_err}\nلطفاً چند لحظه بعد دوباره تلاش فرمایید.")
+    except ValueError as ve:
+        bot.send_message(chat_id, f"⚠️ {ve}")
     except Exception as e:
         log_error(chat_id, f"Error processing excel upload: {e}", e)
-        bot.send_message(chat_id, f"❌ خطا در پردازش فایل: {e}")
+        bot.send_message(chat_id, f"❌ خطا در پردازش فایل: {e}\n(تراکنش لغو شد و اطلاعات قبلی دست‌نخورده باقی ماند)")
 
 # Register handlers
 if TELEBOT_AVAILABLE and bot:

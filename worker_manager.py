@@ -14,6 +14,7 @@ from attendance_manager import attendance_manager
 from shortage_manager import shortage_manager
 from permission_manager import permission_manager
 from excel_manager import excel_manager
+from utils import get_persian_weekday
 
 logger = logging.getLogger("worker_manager")
 
@@ -36,6 +37,31 @@ class WorkerManager:
         threading.Thread(target=self._auto_backup_loop, daemon=True).start()
         logger.info("Background workers started successfully.")
 
+    def get_today_sessions(self, project_id):
+        """
+        Determines the relevant session(s) for today based on exact date or weekday schedule,
+        preventing incorrect assumptions about 'sessions[-1]'.
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_day = get_persian_weekday(datetime.now())
+
+        all_sessions = attendance_manager.list_sessions(project_id, include_cancelled=False)
+        if not all_sessions:
+            return []
+
+        # 1. Exact date match
+        date_matches = [s for s in all_sessions if str(s.get('session_date', '')).strip() == today_str]
+        if date_matches:
+            return date_matches
+
+        # 2. Weekday match for recurring schedules
+        day_matches = [s for s in all_sessions if today_day and today_day in str(s.get('day_of_week', '')).strip()]
+        if day_matches:
+            return day_matches
+
+        # 3. Fallback to latest session only if project has active single session
+        return [all_sessions[-1]]
+
     def _daily_report_loop(self):
         while True:
             try:
@@ -47,25 +73,23 @@ class WorkerManager:
                     active_projects = project_manager.list_projects(status='ACTIVE')
                     for proj in active_projects:
                         pid = proj['id']
-                        sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
-                        if not sessions:
-                            continue
-                        active_session = sessions[-1]
-                        sid = active_session['id']
+                        today_sessions = self.get_today_sessions(pid)
+                        for active_session in today_sessions:
+                            sid = active_session['id']
 
-                        attendance_manager.mark_empty_as_absent(pid, sid)
-                        excel_path = excel_manager.export_project_excel(pid)
+                            attendance_manager.mark_empty_as_absent(pid, sid)
+                            excel_path = excel_manager.export_project_excel(pid)
 
-                        if self.bot and excel_path and os.path.exists(excel_path):
-                            members = permission_manager.get_project_members(pid)
-                            recipients = [m['user_id'] for m in members if m['role'] in ('admin', 'super_admin') and m['is_active']]
-                            caption = "📊 **گزارش پایانی و فایل نهایی - " + str(proj['name']) + " (" + str(active_session['name']) + ")**\nافراد تعیین تکلیف نشده خودکار غایب خوردند."
-                            for uid in set(recipients):
-                                try:
-                                    with open(excel_path, "rb") as f:
-                                        self.bot.send_document(uid, f, caption=caption, parse_mode="Markdown")
-                                except Exception as err:
-                                    logger.error(f"Failed to send daily report to {uid}: {err}")
+                            if self.bot and excel_path and os.path.exists(excel_path):
+                                members = permission_manager.get_project_members(pid)
+                                recipients = [m['user_id'] for m in members if m['role'] in ('admin', 'super_admin') and m['is_active']]
+                                caption = f"📊 **گزارش پایانی و فایل نهایی - {proj['name']} ({active_session['name']})**\nافراد تعیین تکلیف نشده خودکار غایب خوردند."
+                                for uid in set(recipients):
+                                    try:
+                                        with open(excel_path, "rb") as f:
+                                            self.bot.send_document(uid, f, caption=caption, parse_mode="Markdown")
+                                    except Exception as err:
+                                        logger.error(f"Failed to send daily report to {uid}: {err}")
 
                     self.last_daily_report_date = now.date()
             except Exception as e:
@@ -79,24 +103,25 @@ class WorkerManager:
                 active_projects = project_manager.list_projects(status='ACTIVE')
                 for proj in active_projects:
                     pid = proj['id']
-                    sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
-                    if not sessions:
-                        continue
-                    active_session = sessions[-1]
-                    sid = active_session['id']
+                    today_sessions = self.get_today_sessions(pid)
+                    for active_session in today_sessions:
+                        sid = active_session['id']
 
-                    latecomers = attendance_manager.get_latecomers(pid, sid)
-                    untracked_late = [l for l in latecomers if not str(l.get('late_tracking', '')).strip()]
+                        latecomers = attendance_manager.get_latecomers(pid, sid)
+                        untracked_late = [l for l in latecomers if not str(l.get('late_tracking', '')).strip()]
 
-                    if untracked_late and self.bot:
-                        msg = f"⚠️ **یادآوری لیست متأخرین - {proj['name']}:**\nهم‌اکنون **{len(untracked_late)} نفر** در جلسه «{active_session['name']}» بدون پیگیری تأخیر هستند. لطفاً جهت پیگیری تماس بگیرید."
-                        members = permission_manager.get_project_members(pid)
-                        for m in members:
-                            if m['is_active']:
-                                try:
-                                    self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
-                                except Exception:
-                                    pass
+                        if untracked_late and self.bot:
+                            msg = f"⚠️ **یادآوری لیست متأخرین - {proj['name']}:**\nهم‌اکنون **{len(untracked_late)} نفر** در جلسه «{active_session['name']}» بدون پیگیری تأخیر هستند. لطفاً جهت پیگیری تماس بگیرید."
+                            members = permission_manager.get_project_members(pid)
+                            for m in members:
+                                # Check if member is active, not unit_head, and has not marked daily absence for today
+                                if m['is_active'] and m.get('role') != 'unit_head':
+                                    if permission_manager.is_operator_absent_today(pid, m['user_id']):
+                                        continue
+                                    try:
+                                        self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
+                                    except Exception:
+                                        pass
             except Exception as e:
                 logger.error(f"Error in late_reminder_loop: {e}")
 
@@ -130,6 +155,8 @@ class WorkerManager:
                         members = permission_manager.get_project_members(pid)
                         for m in members:
                             if m['is_active'] and m.get('role') != 'unit_head' and (m['role'] in ('admin', 'super_admin') or m['project_gender'] == target_grp):
+                                if permission_manager.is_operator_absent_today(pid, m['user_id']):
+                                    continue
                                 try:
                                     self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
                                 except Exception:
@@ -146,7 +173,7 @@ class WorkerManager:
                 db_instance.backup_database(label="hourly")
                 active_projects = project_manager.list_projects(status='ACTIVE')
                 for proj in active_projects:
-                    excel_manager.backup_project_excel(proj['id'])
+                    excel_manager.backup_project_excel(proj['id'], label="hourly")
             except Exception as e:
                 logger.error(f"Error in auto_backup_loop: {e}")
 

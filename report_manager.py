@@ -3,7 +3,7 @@ import sys
 from datetime import datetime
 from db_manager import db_instance
 from attendance_manager import attendance_manager
-from utils import safe_markdown
+from utils import safe_markdown, normalize_persian
 
 class ReportManager:
     def __init__(self, db=db_instance):
@@ -55,10 +55,10 @@ class ReportManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('''
+            cursor.execute("""
             INSERT INTO staff_logs (project_id, user_id, action_type, log_date, created_at)
             VALUES (?, ?, ?, ?, ?)
-            ''', (project_id, user_id, action_type, today, now_iso))
+            """, (project_id, user_id, action_type, today, now_iso))
             conn.commit()
         except Exception:
             pass
@@ -69,12 +69,12 @@ class ReportManager:
         target_date = date_str or datetime.now().strftime("%Y-%m-%d")
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        query = '''
+        query = """
         SELECT l.user_id, l.action_type, COUNT(*) as cnt, u.staff_name
         FROM staff_logs l
         LEFT JOIN users u ON l.user_id = u.user_id
         WHERE l.log_date = ?
-        '''
+        """
         params = [target_date]
         if project_id:
             query += " AND l.project_id = ?"
@@ -85,21 +85,24 @@ class ReportManager:
         conn.close()
         return [dict(r) for r in rows]
 
-
     def generate_class_text_report(self, project_id, session_id):
+        """
+        Template-driven class text report based on:
+        Project Info + Org Chart (with business display_order) + Session Attendance Roster.
+        Dynamically adapts to any project or schedule structure.
+        """
         from project_manager import project_manager
-        from attendance_manager import attendance_manager
-        from utils import normalize_persian
 
         proj = project_manager.get_project(project_id)
         sess = attendance_manager.get_session(session_id)
         all_att = attendance_manager.get_session_attendance(project_id, session_id)
+        org_chart = project_manager.get_project_org_chart(project_id)
 
         proj_name = proj['name'] if proj else "کلاس"
         sess_date = sess.get('session_date') or datetime.now().strftime("%Y/%m/%d") if sess else ""
 
         def format_staff(s):
-            name = s['name']
+            name = s.get('name', '')
             st = (s.get('status') or '').strip()
             g_prefix = "آقا" if s.get('gender') == 'آقا' else "خانم"
             status_part = f" ({st})" if st else ""
@@ -110,6 +113,7 @@ class ReportManager:
                 return ""
             return ", ".join([format_staff(s) for s in staff_list])
 
+        # 1. Identify Senior / Arshad staff
         arshad_staff = None
         for s in all_att:
             pos = str(s.get('position', '')).strip()
@@ -119,6 +123,7 @@ class ReportManager:
                 arshad_staff = s
                 break
 
+        # 2. Group staff by normalized unit and section
         units_data = {}
         for s in all_att:
             if s == arshad_staff:
@@ -140,37 +145,17 @@ class ReportManager:
                 units_data[u_raw]['sections'][sec_raw].append(s)
             units_data[u_raw]['all_staff'].append(s)
 
-        def get_unit_bucket(keyword):
-            kw_norm = normalize_persian(keyword)
-            for u_name, data in units_data.items():
-                if kw_norm in normalize_persian(u_name):
-                    return data
-            return None
-
-        def get_section_staff(unit_bucket, sec_keyword):
-            if not unit_bucket: return []
-            sec_kw_norm = normalize_persian(sec_keyword)
-            matched = []
-            for sec_name, staff_list in unit_bucket['sections'].items():
-                if sec_kw_norm in normalize_persian(sec_name):
-                    matched.extend(staff_list)
-            return matched
-
-        def get_head_str(unit_bucket, default_prefix="خانم"):
-            if unit_bucket and unit_bucket['head']:
-                return format_staff_list(unit_bucket['head'])
-            return f"{default_prefix} "
-
-        def get_deputy_str(unit_bucket):
-            if unit_bucket and unit_bucket['deputy']:
-                return format_staff_list(unit_bucket['deputy'])
-            return ""
+        # 3. Determine units to render in order (from org_chart first, then any extra units)
+        ordered_units = list(org_chart.keys())
+        for u in units_data.keys():
+            if u not in ordered_units:
+                ordered_units.append(u)
 
         lines = []
         lines.append(f"{proj_name}")
         lines.append(f"تاریخ: {sess_date}")
         lines.append("")
-        
+
         if arshad_staff:
             g_prefix = "آقا" if arshad_staff.get('gender') == 'آقا' else "خانم"
             st_part = f" ({arshad_staff['status']})" if arshad_staff.get('status') else ""
@@ -181,96 +166,42 @@ class ReportManager:
             lines.append("۰۹...")
         lines.append("")
 
-        u_amoozesh = get_unit_bucket("آموزش")
-        lines.append(f"* واحد امور آموزش:* {get_head_str(u_amoozesh)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_amoozesh)}")
-        lines.append("")
-        paziresh = get_section_staff(u_amoozesh, "پذیرش")
-        lines.append("بخش پذیرش:")
-        lines.append(f"نیروها: {format_staff_list(paziresh)}")
-        lines.append("")
-        barkhat = get_section_staff(u_amoozesh, "برخط")
-        lines.append("بخش برخط:")
-        lines.append(f"نیروها: {format_staff_list(barkhat)}")
-        lines.append("")
+        for u_name in ordered_units:
+            u_data = units_data.get(u_name)
+            head_str = format_staff_list(u_data['head']) if u_data and u_data['head'] else "خانم "
+            deputy_str = format_staff_list(u_data['deputy']) if u_data and u_data['deputy'] else ""
 
-        u_mohit = get_unit_bucket("محیط")
-        lines.append(f"*واحد محیط:* {get_head_str(u_mohit)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_mohit)}")
-        mohit_staff = []
-        if u_mohit:
-            for s_list in u_mohit['sections'].values(): mohit_staff.extend(s_list)
-        lines.append(f"نیروها: {format_staff_list(mohit_staff)}")
-        lines.append("")
+            lines.append(f"*واحد {u_name}:* {head_str}")
+            if deputy_str:
+                lines.append(f"جانشین مسئول واحد: {deputy_str}")
+            lines.append("")
 
-        u_entezamat = get_unit_bucket("انتظامات")
-        lines.append(f"*واحد انتظامات:* {get_head_str(u_entezamat)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_entezamat)}")
-        entezamat_staff = []
-        if u_entezamat:
-            for s_list in u_entezamat['sections'].values(): entezamat_staff.extend(s_list)
-        lines.append(f"نیروها: {format_staff_list(entezamat_staff)}")
-        lines.append("")
+            # Render sections for this unit (from org_chart sections if defined, else from staff data)
+            sections_in_chart = org_chart.get(u_name, [])
+            all_unit_sections = list(sections_in_chart)
+            if u_data:
+                for sec in u_data['sections'].keys():
+                    if sec not in all_unit_sections:
+                        all_unit_sections.append(sec)
 
-        u_tadarokat = get_unit_bucket("تدارکات")
-        lines.append(f"*واحد تدارکات:* {get_head_str(u_tadarokat)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_tadarokat)}")
-        lines.append("")
-        amadehsazi = get_section_staff(u_tadarokat, "آماده سازی") or get_section_staff(u_tadarokat, "آمادهسازی")
-        lines.append("بخش آمادهسازی:")
-        lines.append(f"نیروها: {format_staff_list(amadehsazi)}")
-        lines.append("")
-        pazirayi = [s for s in get_section_staff(u_tadarokat, "پذیرایی") if "استاد" not in s.get('section', '')]
-        lines.append("بخش پذیرایی:")
-        lines.append(f"نیروها: {format_staff_list(pazirayi)}")
-        lines.append("")
-        pazirayi_ostad = get_section_staff(u_tadarokat, "پذیرایی استاد") or get_section_staff(u_tadarokat, "استاد")
-        lines.append(f"بخش پذیرایی استاد: {format_staff_list(pazirayi_ostad)}")
-        lines.append("")
+            # Filter out non-sections like '-', 'عمومی', or empty if there are specific sections
+            valid_secs = [sec for sec in all_unit_sections if sec and sec not in ('-', 'None', 'عمومی')]
 
-        u_resane = get_unit_bucket("رسانه")
-        lines.append(f"*واحد رسانه:* {get_head_str(u_resane)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_resane)}")
-        lines.append("")
-        samiobasari = get_section_staff(u_resane, "سمعی") or get_section_staff(u_resane, "بصری")
-        lines.append("بخش سمعی و بصری:")
-        lines.append(f"نیروها: {format_staff_list(samiobasari)}")
-        lines.append("")
-        pakhsh = get_section_staff(u_resane, "پخش")
-        lines.append(f"بخش پخش رسانه: {format_staff_list(pakhsh)}")
-        lines.append("")
+            if valid_secs:
+                for sec in valid_secs:
+                    sec_staff = u_data['sections'].get(sec, []) if u_data else []
+                    lines.append(f"بخش {sec}:")
+                    lines.append(f"نیروها: {format_staff_list(sec_staff)}")
+                    lines.append("")
+            else:
+                unit_general_staff = []
+                if u_data:
+                    for s_list in u_data['sections'].values():
+                        unit_general_staff.extend(s_list)
+                if unit_general_staff:
+                    lines.append(f"نیروها: {format_staff_list(unit_general_staff)}")
+                    lines.append("")
 
-        u_ravabet = get_unit_bucket("روابط عمومی")
-        lines.append(f"*واحد روابط عمومی:* {get_head_str(u_ravabet)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_ravabet)}")
-        lines.append("")
-        ertebatat = get_section_staff(u_ravabet, "ارتباطات")
-        lines.append(f"بخش ارتباطات:")
-        lines.append(f"نیرو: {format_staff_list(ertebatat)}")
-        lines.append("")
-        kheyriyeh = get_section_staff(u_ravabet, "خیریه")
-        lines.append(f"بخش خیریه: {format_staff_list(kheyriyeh)}")
-        lines.append("")
-
-        u_anbar = get_unit_bucket("انبار")
-        lines.append(f"*واحد انبار:* {get_head_str(u_anbar)}")
-        anbar_staff = []
-        if u_anbar:
-            for s_list in u_anbar['sections'].values(): anbar_staff.extend(s_list)
-        lines.append(f"نیرو: {format_staff_list(anbar_staff)}")
-        lines.append("")
-
-        u_kader = get_unit_bucket("امورکادر") or get_unit_bucket("امور کادر") or get_unit_bucket("کادر")
-        lines.append(f"*واحد امورکادر:* {get_head_str(u_kader)}")
-        lines.append(f"جانشین مسئول واحد: {get_deputy_str(u_kader)}")
-        lines.append("")
-        kader_staff = []
-        if u_kader:
-            for s_list in u_kader['sections'].values(): kader_staff.extend(s_list)
-        lines.append(f"نیرو: {format_staff_list(kader_staff)}")
-
-        return "\n".join(lines)
-
+        return "\n".join(lines).strip()
 
 report_manager = ReportManager()
-

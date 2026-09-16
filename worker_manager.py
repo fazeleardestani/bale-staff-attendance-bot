@@ -40,9 +40,16 @@ class WorkerManager:
     def get_today_sessions(self, project_id):
         """
         Determines the relevant session(s) for today strictly based on date or schedule.
-        STRICT REQUIREMENT: NO arbitrary guessing or falling back to sessions[-1].
-        If no session is scheduled or occurring today, returns an empty list [].
+        Validates:
+        1. Project is ACTIVE.
+        2. Session is not CANCELLED.
+        3. Schedule (if present) is strictly ACTIVE (is_active == 1).
+        If no active session is occurring today, returns an empty list [].
         """
+        proj = project_manager.get_project(project_id)
+        if not proj or proj.get('status') != 'ACTIVE':
+            return []
+
         today_str = datetime.now().strftime("%Y-%m-%d")
         today_day = get_persian_weekday(datetime.now())
 
@@ -50,20 +57,36 @@ class WorkerManager:
         if not all_sessions:
             return []
 
+        # Query all active schedules for this project
+        conn = db_instance.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM schedules WHERE project_id = ? AND is_active = 1", (project_id,))
+        active_sched_ids = {r['id'] for r in cursor.fetchall()}
+        conn.close()
+
+        valid_candidates = []
+        for s in all_sessions:
+            if s.get('status') == 'CANCELLED':
+                continue
+            sched_id = s.get('schedule_id')
+            if sched_id is not None and sched_id not in active_sched_ids:
+                # Schedule is inactive/paused: skip session!
+                continue
+            valid_candidates.append(s)
+
         # 1. Exact calendar date match (today)
         date_matches = [
-            s for s in all_sessions 
-            if str(s.get('session_date', '')).strip() == today_str and s.get('status') != 'CANCELLED'
+            s for s in valid_candidates 
+            if str(s.get('session_date', '')).strip() == today_str
         ]
         if date_matches:
             return date_matches
 
         # 2. Weekday match for recurring schedules on active sessions occurring today
         day_matches = [
-            s for s in all_sessions 
+            s for s in valid_candidates 
             if today_day and today_day in str(s.get('day_of_week', '')).strip() 
             and (not s.get('session_date') or str(s.get('session_date', '')).strip() == today_str)
-            and s.get('status') != 'CANCELLED'
         ]
         if day_matches:
             return day_matches

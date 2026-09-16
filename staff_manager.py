@@ -121,7 +121,7 @@ class StaffManager:
         VALUES (?, ?, ?, ?, 1, ?)
         ON CONFLICT(schedule_id, staff_id) DO UPDATE SET
             start_session_id = COALESCE(excluded.start_session_id, schedule_staff.start_session_id),
-            end_session_id = excluded.end_session_id,
+            end_session_id = NULL,
             is_active = 1
         """, (schedule_id, staff_id, start_session_id, end_session_id, now_iso))
         conn.commit()
@@ -131,14 +131,11 @@ class StaffManager:
     def remove_staff_from_schedule(self, schedule_id, staff_id, end_session_id=None):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        if end_session_id is not None:
-            cursor.execute("""
-            UPDATE schedule_staff SET end_session_id = ? WHERE schedule_id = ? AND staff_id = ?
-            """, (end_session_id, schedule_id, staff_id))
-        else:
-            cursor.execute("""
-            UPDATE schedule_staff SET is_active = 0 WHERE schedule_id = ? AND staff_id = ?
-            """, (schedule_id, staff_id))
+        cursor.execute("""
+        UPDATE schedule_staff 
+        SET is_active = 0, end_session_id = ? 
+        WHERE schedule_id = ? AND staff_id = ?
+        """, (end_session_id, schedule_id, staff_id))
         conn.commit()
         conn.close()
         return True

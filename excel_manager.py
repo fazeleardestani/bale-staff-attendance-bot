@@ -3,6 +3,11 @@ import sys
 import importlib.abc
 import importlib.util
 import logging
+import tempfile
+import shutil
+import openpyxl
+from copy import copy
+from datetime import datetime
 
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
@@ -20,10 +25,6 @@ class _DirectFinder(importlib.abc.MetaPathFinder):
 if not any(isinstance(f, _DirectFinder) for f in sys.meta_path):
     sys.meta_path.insert(0, _DirectFinder())
 
-import openpyxl
-from copy import copy
-import shutil
-from datetime import datetime
 from config import PROJECT_FILES_DIR, EXCEL_BACKUPS_DIR, BASE_PATH
 from db_manager import db_instance
 from project_manager import project_manager
@@ -60,7 +61,7 @@ class ExcelManager:
             target_path = os.path.join(category_dir, backup_name)
             shutil.copy2(excel_path, target_path)
 
-            # Retention policy: keep last 15 backups
+            # Retention policy: keep last 15 backups with explicit logging
             try:
                 files = sorted(
                     [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".xlsx")],
@@ -69,8 +70,8 @@ class ExcelManager:
                 if len(files) > 15:
                     for old_f in files[:-15]:
                         os.remove(old_f)
-            except Exception:
-                pass
+            except Exception as ret_err:
+                logging.warning(f"Excel backup retention cleanup notice: {ret_err}")
 
             return target_path
         return None
@@ -115,37 +116,49 @@ class ExcelManager:
 
     def import_project_excel(self, project_id, uploaded_file_path):
         """
-        Transactional, schedule-aware import of project Excel file.
+        Two-Phase Commit, schedule-lifecycle-aware import of project Excel file.
         1. Validates extension (rejects .xls).
-        2. Creates safety backups (database + excel).
-        3. Enforces schedule roster invariant:
-           If a session belongs to a schedule, attendance is STRICTLY constrained to schedule_staff.
-           If schedule_staff is empty, the sheet initializes schedule_staff and future empty sessions sync from it.
-           If schedule_staff already has assigned members, staff outside the roster are NOT added to attendance.
-        4. Atomic transaction with full rollback on error.
+        2. Copies uploaded Excel to staging path and validates structure upfront.
+        3. Creates safety backups (DB + Excel).
+        4. Applies all DB updates (Org chart, Shortages, Schedule Staff, Attendance Snapshots) in a single DB transaction.
+           - New staff in sheet -> added to schedule_staff.
+           - Existing staff in sheet -> reactivated/maintained.
+           - Omitted staff from sheet -> deactivated in schedule_staff (membership lifecycle without deleting project_staff).
+        5. Atomically replaces target Excel on disk ONLY AFTER DB transaction commits.
+        6. Full automated recovery if physical file replacement fails.
         """
         if uploaded_file_path.lower().endswith('.xls') and not uploaded_file_path.lower().endswith('.xlsx'):
             raise ValueError("فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
 
         from attendance_manager import attendance_manager
 
-        # Create safety pre-update backups
-        self.backup_project_excel(project_id, label="pre_update")
-        db_instance.backup_database(label="pre_update")
+        # Phase 1: Staging & Validation
+        temp_staging = tempfile.mktemp(suffix=".xlsx")
+        try:
+            shutil.copy2(uploaded_file_path, temp_staging)
+        except Exception as e:
+            raise ValueError(f"امکان خواندن فایل آپلود شده وجود ندارد: {e}")
 
-        proj_excel_path = self.get_project_excel_path(project_id)
-        if os.path.abspath(uploaded_file_path) != os.path.abspath(proj_excel_path):
-            shutil.copy2(uploaded_file_path, proj_excel_path)
-        project_manager.update_project_excel_path(project_id, proj_excel_path)
+        try:
+            wb = openpyxl.load_workbook(temp_staging, data_only=True)
+        except Exception as e:
+            if os.path.exists(temp_staging):
+                os.remove(temp_staging)
+            raise ValueError(f"فایل ارسالی یک فایل معتبر اکسل نمی‌باشد: {e}")
 
-        wb = openpyxl.load_workbook(proj_excel_path, data_only=True)
         exclude_sheets = ['تامین نیرو', 'چارت', 'داشبورد']
         valid_sheets = [s for s in wb.sheetnames if s not in exclude_sheets]
+
+        # Phase 2: Create Pre-Update Backups
+        db_backup_path = db_instance.backup_database(label="pre_update")
+        excel_backup_path = self.backup_project_excel(project_id, label="pre_update")
+        proj_excel_path = self.get_project_excel_path(project_id)
 
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         now_iso = datetime.now().isoformat()
 
+        # Phase 3: Database Transaction
         try:
             with conn:
                 # 1. Organizational Chart with display order
@@ -177,34 +190,26 @@ class ExcelManager:
                             VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
                             """, (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
 
-                # 3. Sessions & Staff (Schedule-Aware)
+                # 3. Sheets -> Schedule Staff Lifecycle & Session Attendance
                 for sheet_name in valid_sheets:
-                    session = attendance_manager.get_session_by_name(project_id, sheet_name)
+                    # Match schedule if sheet corresponds to schedule name
+                    cursor.execute("""
+                    SELECT id FROM schedules 
+                    WHERE project_id = ? AND (name = ? OR ? LIKE '%' || name || '%' OR name LIKE '%' || ? || '%') AND is_active = 1
+                    """, (project_id, sheet_name, sheet_name, sheet_name))
+                    matched_sched = cursor.fetchone()
+                    sched_id = matched_sched['id'] if matched_sched else None
+
+                    session = attendance_manager.get_session_by_name(project_id, sheet_name, schedule_id=sched_id)
                     if not session:
-                        # Match schedule by name or substring if exists
-                        cursor.execute("""
-                        SELECT id FROM schedules 
-                        WHERE project_id = ? AND (name = ? OR ? LIKE '%' || name || '%' OR name LIKE '%' || ? || '%') AND is_active = 1
-                        """, (project_id, sheet_name, sheet_name, sheet_name))
-                        matched_sched = cursor.fetchone()
-                        sched_id = matched_sched['id'] if matched_sched else None
-                        
                         session_id = attendance_manager.create_session(
                             project_id, sheet_name, schedule_id=sched_id, 
                             copy_from_prev_session=False, sync_excel_sheet=False
                         )
                     else:
                         session_id = session['id']
-                        sched_id = session.get('schedule_id')
-
-                    # Check existing roster in schedule_staff for this schedule
-                    existing_schedule_staff_ids = set()
-                    is_initial_schedule_setup = False
-                    if sched_id is not None:
-                        cursor.execute("SELECT staff_id FROM schedule_staff WHERE schedule_id = ? AND is_active = 1", (sched_id,))
-                        existing_schedule_staff_ids = {r['staff_id'] for r in cursor.fetchall()}
-                        if len(existing_schedule_staff_ids) == 0:
-                            is_initial_schedule_setup = True
+                        if not sched_id:
+                            sched_id = session.get('schedule_id')
 
                     ws = wb[sheet_name]
                     header_map = {}
@@ -213,7 +218,7 @@ class ExcelManager:
                         if val:
                             header_map[str(val).strip()] = c
 
-                    enrolled_in_sheet = []
+                    sheet_staff_ids = set()
 
                     for r_idx in range(2, ws.max_row + 1):
                         def get_val(col_name):
@@ -238,7 +243,7 @@ class ExcelManager:
                         gender = get_val("جنسیت")
                         is_multi = get_val("فعال در چند بخش؟") or "خیر"
 
-                        # Stable identity: check staff_code first if available
+                        # Stable identity
                         staff_row = None
                         if staff_code:
                             cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, staff_code))
@@ -272,88 +277,77 @@ class ExcelManager:
                                 auto_code = f"STF-{staff_id:05d}"
                                 cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
 
-                        # ROSTER INVARIANT VERIFICATION:
-                        can_record_attendance = True
+                        sheet_staff_ids.add(staff_id)
+
+                        # Update schedule_staff lifecycle
                         if sched_id is not None:
-                            if is_initial_schedule_setup:
-                                # Initial setup of this schedule via Excel sheet
-                                cursor.execute("""
-                                INSERT INTO schedule_staff (schedule_id, staff_id, is_active, created_at)
-                                VALUES (?, ?, 1, ?)
-                                ON CONFLICT(schedule_id, staff_id) DO UPDATE SET is_active = 1
-                                """, (sched_id, staff_id, now_iso))
-                                existing_schedule_staff_ids.add(staff_id)
-                                can_record_attendance = True
-                            else:
-                                # Schedule ALREADY has an established roster:
-                                # Staff must be an enrolled active member of this schedule!
-                                if staff_id in existing_schedule_staff_ids:
-                                    can_record_attendance = True
-                                else:
-                                    can_record_attendance = False
-                                    logging.warning(f"Excel import: Staff '{name}' (ID {staff_id}) is not in schedule {sched_id} roster. Skipping attendance for session {session_id}.")
-
-                        if can_record_attendance:
-                            enrolled_in_sheet.append({
-                                'id': staff_id, 'name': name, 'unit': unit, 
-                                'section': section, 'position': pos, 'gender': gender
-                            })
                             cursor.execute("""
-                            INSERT INTO attendance (
-                                project_id, session_id, staff_id, status, card_status, late_tracking, description,
-                                staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
-                                updated_at
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                                status = excluded.status,
-                                card_status = excluded.card_status,
-                                late_tracking = excluded.late_tracking,
-                                description = excluded.description,
-                                staff_name_snapshot = excluded.staff_name_snapshot,
-                                unit_snapshot = excluded.unit_snapshot,
-                                section_snapshot = excluded.section_snapshot,
-                                position_snapshot = excluded.position_snapshot,
-                                gender_snapshot = excluded.gender_snapshot,
-                                updated_at = excluded.updated_at
-                            """, (
-                                project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
-                                name, unit, section, pos, gender,
-                                now_iso
-                            ))
+                            INSERT INTO schedule_staff (schedule_id, staff_id, start_session_id, is_active, created_at)
+                            VALUES (?, ?, ?, 1, ?)
+                            ON CONFLICT(schedule_id, staff_id) DO UPDATE SET
+                                start_session_id = COALESCE(schedule_staff.start_session_id, excluded.start_session_id),
+                                end_session_id = NULL,
+                                is_active = 1
+                            """, (sched_id, staff_id, session_id, now_iso))
 
-                    # Auto-sync future empty sessions of the same schedule if this schedule was initialized
-                    if sched_id is not None and is_initial_schedule_setup and enrolled_in_sheet:
+                        # Insert/Update attendance for this session with snapshot
                         cursor.execute("""
-                        SELECT id FROM sessions 
-                        WHERE project_id = ? AND schedule_id = ? AND id != ? AND status != 'CANCELLED'
-                        """, (project_id, sched_id, session_id))
-                        other_sessions = cursor.fetchall()
-                        for osess in other_sessions:
-                            osid = osess['id']
-                            cursor.execute("SELECT COUNT(*) FROM attendance WHERE project_id = ? AND session_id = ?", (project_id, osid))
-                            if cursor.fetchone()[0] == 0:
-                                for s_item in enrolled_in_sheet:
-                                    cursor.execute("""
-                                    INSERT INTO attendance (
-                                        project_id, session_id, staff_id, status, card_status,
-                                        staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
-                                        updated_at
-                                    )
-                                    VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
-                                    ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
-                                    """, (
-                                        project_id, osid, s_item['id'],
-                                        s_item['name'], s_item['unit'], s_item['section'], s_item['position'], s_item['gender'],
-                                        now_iso
-                                    ))
+                        INSERT INTO attendance (
+                            project_id, session_id, staff_id, status, card_status, late_tracking, description,
+                            staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
+                            status = excluded.status,
+                            card_status = excluded.card_status,
+                            late_tracking = excluded.late_tracking,
+                            description = excluded.description,
+                            staff_name_snapshot = excluded.staff_name_snapshot,
+                            unit_snapshot = excluded.unit_snapshot,
+                            section_snapshot = excluded.section_snapshot,
+                            position_snapshot = excluded.position_snapshot,
+                            gender_snapshot = excluded.gender_snapshot,
+                            updated_at = excluded.updated_at
+                        """, (
+                            project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
+                            name, unit, section, pos, gender,
+                            now_iso
+                        ))
+
+                    # Deactivate schedule_staff members who are removed from this sheet
+                    if sched_id is not None and sheet_staff_ids:
+                        placeholders = ','.join(['?'] * len(sheet_staff_ids))
+                        cursor.execute(f"""
+                        UPDATE schedule_staff 
+                        SET is_active = 0, end_session_id = ?
+                        WHERE schedule_id = ? AND is_active = 1 AND staff_id NOT IN ({placeholders})
+                        """, [session_id, sched_id] + list(sheet_staff_ids))
 
         except Exception as err:
-            logging.error(f"Excel import failed and was rolled back: {err}")
+            logging.error(f"Excel import DB transaction failed and rolled back: {err}")
+            if os.path.exists(temp_staging):
+                os.remove(temp_staging)
             raise err
         finally:
             conn.close()
             wb.close()
+
+        # Phase 4: Atomic Physical File Replacement (Post-Commit)
+        try:
+            shutil.copy2(temp_staging, proj_excel_path)
+            project_manager.update_project_excel_path(project_id, proj_excel_path)
+        except Exception as fs_err:
+            logging.critical(f"Failed to copy staging Excel to destination: {fs_err}")
+            # Two-phase recovery
+            if db_backup_path and os.path.exists(db_backup_path):
+                db_instance.restore_backup(db_backup_path)
+            if excel_backup_path and os.path.exists(excel_backup_path) and os.path.exists(proj_excel_path):
+                shutil.copy2(excel_backup_path, proj_excel_path)
+            raise RuntimeError(f"خطا در جایگزینی فایل فیزیکی اکسل. پایگاه داده و فایل به وضعیت قبل بازگردانی شدند: {fs_err}")
+        finally:
+            if os.path.exists(temp_staging):
+                os.remove(temp_staging)
 
         return True
 

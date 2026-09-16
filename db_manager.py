@@ -320,6 +320,7 @@ class DatabaseManager:
                     ("idx_attendance_lookup", "attendance (project_id, session_id, staff_id)"),
                     ("idx_sessions_project", "sessions (project_id)"),
                     ("idx_sessions_sched_date", "sessions (project_id, schedule_id, session_date)"),
+                    ("uidx_sessions_sched_date", "sessions (project_id, schedule_id, session_date) WHERE schedule_id IS NOT NULL AND session_date != '' AND session_date IS NOT NULL"),
                     ("idx_shortages_project", "shortages (project_id, status)"),
                     ("idx_project_users_uid", "project_users (user_id)"),
                     ("idx_staff_logs_date", "staff_logs (log_date, project_id)"),
@@ -483,8 +484,8 @@ class DatabaseManager:
                     if len(files) > 15:
                         for old_f in files[:-15]:
                             os.remove(old_f)
-                except Exception:
-                    pass
+                except Exception as ret_err:
+                    logging.warning(f"Database backup retention cleanup notice: {ret_err}")
 
                 logging.info(f"Database safe verified online backup created: {target_path}")
                 return target_path

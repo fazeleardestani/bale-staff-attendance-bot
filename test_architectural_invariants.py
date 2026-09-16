@@ -155,7 +155,7 @@ class TestArchitecturalInvariants(unittest.TestCase):
 
     def test_05_schedule_project_ownership_enforcement(self):
         """
-        P1 Requirement 11:
+        P1 Requirement:
         Creating a session or assigning staff with a schedule belonging to another project must be rejected.
         """
         ts = str(datetime.now().timestamp())
@@ -202,7 +202,7 @@ class TestArchitecturalInvariants(unittest.TestCase):
 
     def test_07_create_session_atomicity(self):
         """
-        P1 Requirement 8:
+        P1 Requirement:
         create_session must be atomic. Session insert and attendance snapshot commit together.
         """
         ts = str(datetime.now().timestamp())
@@ -249,62 +249,75 @@ class TestArchitecturalInvariants(unittest.TestCase):
         if os.path.exists(test_restore_path):
             os.remove(test_restore_path)
 
-    def test_09_excel_import_schedule_roster_isolation(self):
+    def test_09_excel_schedule_roster_lifecycle(self):
         """
-        P0 Requirement (New):
-        Excel Import MUST NOT bypass Schedule Roster Isolation.
-        If Schedule Monday has Ali, and Schedule Tuesday has Reza:
-        Importing an Excel sheet for Monday that contains BOTH Ali and Reza
-        MUST record attendance for Ali, and MUST REJECT/SKIP Reza for Monday session!
+        P0 Requirement 2:
+        Excel Sheet manages its Schedule Roster lifecycle:
+        1. Initial import adds staff to schedule_staff and records attendance.
+        2. Adding a new staff (Sara) in updated Excel adds her to schedule_staff.
+        3. Removing an old staff (Ali) in updated Excel marks him inactive in schedule_staff
+           without deleting him from project_staff or corrupting past attendance.
         """
         ts = str(datetime.now().timestamp())
-        pid = project_manager.create_project(f"پروژه تست اکسل اسکجول {ts}", project_type="کلاس")
-        sched_mon = attendance_manager.create_schedule(pid, "دوشنبه", "دوشنبه", "16:00")
-        sched_tue = attendance_manager.create_schedule(pid, "سه‌شنبه", "سه‌شنبه", "16:00")
+        pid = project_manager.create_project(f"پروژه تست چرخه کادر اکسل {ts}", project_type="کلاس")
+        sched_mon = attendance_manager.create_schedule(pid, "کلاس دوشنبه", "دوشنبه", "16:00")
 
-        # Ali is enrolled in Monday schedule
-        st_ali = staff_manager.add_staff_member(pid, "علی دوشنبه‌تبار", "09121110001", "آموزش", "پذیرش", gender="آقا", schedule_id=sched_mon)
-        # Reza is enrolled in Tuesday schedule
-        st_reza = staff_manager.add_staff_member(pid, "رضا سه‌شنبه‌تبار", "09121110002", "خدمات", "پذیرایی", gender="آقا", schedule_id=sched_tue)
+        # Session 1
+        sess_1 = attendance_manager.create_session(pid, "کلاس دوشنبه", session_date="2026-10-01", schedule_id=sched_mon)
 
-        # Create Monday session
-        sess_mon = attendance_manager.create_session(pid, "جلسه دوشنبه ۱", schedule_id=sched_mon)
-
-        # Create Excel file with sheet "جلسه دوشنبه ۱"
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "جلسه دوشنبه ۱"
+        # Excel 1: contains Ali
+        wb1 = openpyxl.Workbook()
+        ws1 = wb1.active
+        ws1.title = "کلاس دوشنبه"
         headers = ["ردیف", "واحد", "بخش", "نام و نام خانوادگی", "سمت", "عنوان کارت", "شماره تماس", "ساعت حضور", "پیگیری تاخیر", "توضیحات", "وضعیت کارت", "وضعیت حضور", "جنسیت", "فعال در چند بخش؟"]
-        ws.append(headers)
+        ws1.append(headers)
+        ws1.append([1, "آموزش", "پذیرش", "علی کادر اول", "نیرو", "پذیرش", "09121110001", "16:00", "", "", "تحویل داده شد", "حاضر", "آقا", "خیر"])
+        path1 = f"/tmp/test_roster_v1_{ts}.xlsx"
+        wb1.save(path1)
+        wb1.close()
 
-        # Add Ali (legitimate Monday staff)
-        ws.append([1, "آموزش", "پذیرش", "علی دوشنبه‌تبار", "نیرو", "پذیرش", "09121110001", "16:00", "", "", "تحویل داده شد", "حاضر", "آقا", "خیر"])
-        # Add Reza (intruder, belongs to Tuesday schedule!)
-        ws.append([2, "خدمات", "پذیرایی", "رضا سه‌شنبه‌تبار", "نیرو", "پذیرایی", "09121110002", "16:00", "", "", "تحویل داده شد", "حاضر", "آقا", "خیر"])
+        excel_manager.import_project_excel(pid, path1)
 
-        excel_test_path = f"/tmp/test_excel_isolation_{ts}.xlsx"
-        wb.save(excel_test_path)
-        wb.close()
+        # Check Ali in schedule_staff
+        sched_staff = staff_manager.list_schedule_staff(sched_mon)
+        self.assertEqual(len(sched_staff), 1)
+        self.assertEqual(sched_staff[0]['name'], "علی کادر اول")
 
-        try:
-            # Import Excel
-            excel_manager.import_project_excel(pid, excel_test_path)
+        # Session 2: Excel 2 updates roster: Ali is removed, Sara is added
+        sess_2 = attendance_manager.create_session(pid, "کلاس دوشنبه ۲", session_date="2026-10-08", schedule_id=sched_mon)
+        wb2 = openpyxl.Workbook()
+        ws2 = wb2.active
+        ws2.title = "کلاس دوشنبه ۲"
+        ws2.append(headers)
+        ws2.append([1, "آموزش", "پذیرش", "سارا کادر جدید", "نیرو", "پذیرش", "09121110002", "16:00", "", "", "تحویل داده شد", "حاضر", "خانم", "خیر"])
+        path2 = f"/tmp/test_roster_v2_{ts}.xlsx"
+        wb2.save(path2)
+        wb2.close()
 
-            # Check Monday session attendance
-            rec_ali = attendance_manager.get_staff_session_attendance(pid, sess_mon, st_ali)
-            self.assertIsNotNone(rec_ali, "Ali is in Monday schedule and MUST have attendance!")
-            self.assertEqual(rec_ali['status'], "حاضر")
+        excel_manager.import_project_excel(pid, path2)
 
-            # CRITICAL ASSERTION: Reza MUST NOT have attendance in Monday session!
-            rec_reza = attendance_manager.get_staff_session_attendance(pid, sess_mon, st_reza)
-            self.assertIsNone(rec_reza, "CRITICAL: Reza belongs to Tuesday schedule and MUST NOT be imported into Monday session attendance!")
-        finally:
-            if os.path.exists(excel_test_path):
-                os.remove(excel_test_path)
+        # Verify active roster in schedule_staff has Sara, and Ali is deactivated
+        active_sched_staff = staff_manager.list_schedule_staff(sched_mon, active_only=True)
+        active_names = [s['name'] for s in active_sched_staff]
+        self.assertIn("سارا کادر جدید", active_names)
+        self.assertNotIn("علی کادر اول", active_names, "Ali was removed from sheet and must be deactivated in schedule_staff")
+
+        # Verify Ali is NOT deleted from project_staff
+        all_proj_staff = staff_manager.list_staff(pid, active_only=False)
+        all_names = [s['name'] for s in all_proj_staff]
+        self.assertIn("علی کادر اول", all_names, "Ali must remain in project_staff!")
+
+        # Verify Ali's attendance in Session 1 is intact
+        att_s1 = attendance_manager.get_session_attendance(pid, sess_1)
+        self.assertEqual(len(att_s1), 1)
+        self.assertEqual(att_s1[0]['name'], "علی کادر اول", "Past session attendance for Ali must be 100% preserved!")
+
+        for p in [path1, path2]:
+            if os.path.exists(p): os.remove(p)
 
     def test_10_atomic_add_staff_member_with_schedule(self):
         """
-        P1 Requirement (New):
+        P1 Requirement:
         add_staff_member with schedule_id must be atomic.
         If schedule validation fails, no orphan staff member is created in project_staff.
         """
@@ -321,6 +334,139 @@ class TestArchitecturalInvariants(unittest.TestCase):
         # Verify no orphan staff was created in Project 1
         st_list = staff_manager.list_staff(pid1)
         self.assertEqual(len(st_list), 0, "No orphan staff must exist after rollback!")
+
+    def test_11_excel_import_two_phase_atomic_rollback(self):
+        """
+        P0 Requirement 1:
+        Two-Phase Commit in Excel Import:
+        If a database error occurs during import, the physical project_data.xlsx
+        file MUST NOT be overwritten or modified (retains original content).
+        """
+        ts = str(datetime.now().timestamp())
+        pid = project_manager.create_project(f"پروژه تست اتمیک اکسل {ts}")
+        original_excel_path = excel_manager.get_project_excel_path(pid)
+
+        # Put initial marker in original excel
+        wb_orig = openpyxl.Workbook()
+        ws_orig = wb_orig.active
+        ws_orig.title = "شیت اصلی"
+        ws_orig.append(["نشانگر اصلی قبل از شکست"])
+        wb_orig.save(original_excel_path)
+        wb_orig.close()
+
+        # Create a malicious/corrupted update excel that causes DB failure
+        wb_bad = openpyxl.Workbook()
+        ws_bad = wb_bad.active
+        ws_bad.title = "روز ۱"
+        # Invalid data structure that will trigger constraint failure
+        headers = ["ردیف", "واحد", "بخش", "نام و نام خانوادگی", "سمت", "عنوان کارت", "شماره تماس", "ساعت حضور", "پیگیری تاخیر", "توضیحات", "وضعیت کارت", "وضعیت حضور", "جنسیت", "فعال در چند بخش؟"]
+        ws_bad.append(headers)
+        ws_bad.append([1, "واحد", "بخش", "نام نیرو", "سمت", "کارت", "09120000000", "16:00", "", "", "", "", "آقا", "خیر"])
+        bad_path = f"/tmp/bad_excel_{ts}.xlsx"
+        wb_bad.save(bad_path)
+        wb_bad.close()
+
+        # Mock DB failure by locking or monkeypatching
+        real_get_conn = db_instance.get_sqlite_connection
+        def failing_conn():
+            c = real_get_conn()
+            # Force integrity failure on shortages
+            c.execute("CREATE TRIGGER IF NOT EXISTS fail_trg BEFORE INSERT ON project_staff BEGIN SELECT RAISE(FAIL, 'MOCK_ERROR'); END;")
+            return c
+
+        db_instance.get_sqlite_connection = failing_conn
+        try:
+            with self.assertRaises(Exception):
+                excel_manager.import_project_excel(pid, bad_path)
+
+            # CRITICAL ASSERTION: The original Excel file MUST remain unchanged!
+            wb_check = openpyxl.load_workbook(original_excel_path)
+            self.assertIn("شیت اصلی", wb_check.sheetnames, "Original Excel file must NOT be overwritten when DB fails!")
+            wb_check.close()
+        finally:
+            db_instance.get_sqlite_connection = real_get_conn
+            # Clean trigger
+            c_clean = db_instance.get_sqlite_connection()
+            c_clean.execute("DROP TRIGGER IF EXISTS fail_trg")
+            c_clean.close()
+            if os.path.exists(bad_path): os.remove(bad_path)
+
+    def test_12_worker_skips_inactive_schedule(self):
+        """
+        P1 Requirement:
+        Worker MUST NOT select sessions belonging to a deactivated schedule (is_active == 0).
+        """
+        ts = str(datetime.now().timestamp())
+        pid = project_manager.create_project(f"پروژه تست ورکر اسکجول غیرفعال {ts}")
+        sched = attendance_manager.create_schedule(pid, "کلاس غیرفعال", "دوشنبه", "16:00")
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        sess_id = attendance_manager.create_session(pid, "جلسه امروز", session_date=today_str, schedule_id=sched)
+
+        # When schedule is active -> session is returned
+        sessions_active = worker_manager.get_today_sessions(pid)
+        self.assertEqual(len(sessions_active), 1)
+
+        # Deactivate schedule
+        attendance_manager.set_schedule_active(sched, is_active=False)
+
+        # When schedule is inactive -> session MUST be skipped (empty list)
+        sessions_inactive = worker_manager.get_today_sessions(pid)
+        self.assertEqual(sessions_inactive, [], "Worker must NEVER process sessions of inactive schedules!")
+
+    def test_13_pure_historical_snapshot_no_fallback(self):
+        """
+        P1 Requirement:
+        Historical attendance reads exclusively from snapshot and never leaks future changes in project_staff.
+        """
+        ts = str(datetime.now().timestamp())
+        pid = project_manager.create_project(f"پروژه تست سلامت اسنپ شات {ts}")
+        st_id = staff_manager.add_staff_member(pid, "نام تاریخی اولیه", "09121112233", "واحد قدیم", "بخش قدیم", position="مسئول", gender="خانم")
+        sess_id = attendance_manager.create_session(pid, "روز اول تاریخی")
+
+        # Verify initial snapshot
+        att1 = attendance_manager.get_session_attendance(pid, sess_id)
+        self.assertEqual(att1[0]['name'], "نام تاریخی اولیه")
+        self.assertEqual(att1[0]['unit'], "واحد قدیم")
+
+        # Mutate current staff details in project_staff
+        staff_manager.update_staff_field(st_id, "name", "نام تغییریافته جدید")
+        staff_manager.update_staff_field(st_id, "unit", "واحد کاملا متفاوت")
+
+        # Read historical attendance again
+        att_frozen = attendance_manager.get_session_attendance(pid, sess_id)
+        self.assertEqual(att_frozen[0]['name'], "نام تاریخی اولیه", "Historical name MUST remain the snapshot value!")
+        self.assertEqual(att_frozen[0]['unit'], "واحد قدیم", "Historical unit MUST remain the snapshot value!")
+
+    def test_14_schedule_staff_reactivation_on_rejoin(self):
+        """
+        P1 Requirement:
+        Rejoining a schedule reactivates the same membership without creating duplicate rows.
+        """
+        ts = str(datetime.now().timestamp())
+        pid = project_manager.create_project(f"پروژه تست ورود مجدد {ts}")
+        sched = attendance_manager.create_schedule(pid, "کلاس بازگشت", "شنبه", "10:00")
+        st = staff_manager.add_staff_member(pid, "نیروی بازگشتی", "09123334455", "بخش", "واحد", gender="آقا", schedule_id=sched)
+
+        # Remove from schedule
+        staff_manager.remove_staff_from_schedule(sched, st, end_session_id=5)
+        active_staff = staff_manager.list_schedule_staff(sched, active_only=True)
+        self.assertEqual(len(active_staff), 0)
+
+        # Re-assign to schedule (Rejoin)
+        staff_manager.assign_staff_to_schedule(sched, st, start_session_id=10)
+        active_staff_rejoined = staff_manager.list_schedule_staff(sched, active_only=True)
+        self.assertEqual(len(active_staff_rejoined), 1)
+        self.assertEqual(active_staff_rejoined[0]['sched_start_session'], 10)
+        self.assertIsNone(active_staff_rejoined[0]['sched_end_session'])
+
+        # Verify only 1 row exists in schedule_staff table
+        conn = db_instance.get_sqlite_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM schedule_staff WHERE schedule_id = ? AND staff_id = ?", (sched, st))
+        count = c.fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1, "There must be exactly 1 row per (schedule_id, staff_id)!")
 
 if __name__ == '__main__':
     unittest.main()

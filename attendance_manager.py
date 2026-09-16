@@ -42,20 +42,32 @@ class AttendanceManager:
         conn.close()
         return schedule_id
 
-    def list_schedules(self, project_id):
+    def list_schedules(self, project_id, active_only=True):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM schedules WHERE project_id = ? AND is_active = 1", (project_id,))
+        query = "SELECT * FROM schedules WHERE project_id = ?"
+        if active_only:
+            query += " AND is_active = 1"
+        query += " ORDER BY id ASC"
+        cursor.execute(query, (project_id,))
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    def set_schedule_active(self, schedule_id, is_active):
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE schedules SET is_active = ? WHERE id = ?", (1 if is_active else 0, schedule_id))
+        conn.commit()
+        conn.close()
+        return True
 
     def create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
                        schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
         """
         Creates a session strictly owned by its schedule if provided.
-        Enforces schedule project-ownership.
-        STRICT REQUIREMENT (P0): If schedule_id is provided, only schedule_staff is used.
+        Enforces schedule project-ownership and unique calendar identity (project_id, schedule_id, session_date).
+        STRICT REQUIREMENT: If schedule_id is provided, only schedule_staff is used.
         NO FALLBACK to project_staff if schedule_staff is empty.
         Atomic transaction: session + initial attendance snapshot commit together.
         """
@@ -71,6 +83,17 @@ class AttendanceManager:
 
         now_iso = datetime.now().isoformat()
         date_str = session_date or datetime.now().strftime("%Y-%m-%d")
+
+        # Check existing session by unique schedule + date constraint
+        if schedule_id is not None and date_str:
+            cursor.execute("""
+            SELECT id FROM sessions 
+            WHERE project_id = ? AND schedule_id = ? AND session_date = ? AND status != 'CANCELLED'
+            """, (project_id, schedule_id, date_str))
+            existing = cursor.fetchone()
+            if existing:
+                conn.close()
+                return existing['id']
 
         try:
             with conn:
@@ -145,10 +168,30 @@ class AttendanceManager:
         conn.close()
         return dict(row) if row else None
 
-    def get_session_by_name(self, project_id, name):
+    def get_session_by_name(self, project_id, name, schedule_id=None):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM sessions WHERE project_id = ? AND name = ?", (project_id, name.strip()))
+        if schedule_id is not None:
+            cursor.execute("""
+            SELECT * FROM sessions 
+            WHERE project_id = ? AND name = ? AND schedule_id = ?
+            """, (project_id, name.strip(), schedule_id))
+        else:
+            cursor.execute("""
+            SELECT * FROM sessions 
+            WHERE project_id = ? AND name = ?
+            """, (project_id, name.strip()))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_session_by_date_and_schedule(self, project_id, schedule_id, session_date):
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT * FROM sessions 
+        WHERE project_id = ? AND schedule_id = ? AND session_date = ?
+        """, (project_id, schedule_id, session_date.strip()))
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -202,6 +245,7 @@ class AttendanceManager:
         """
         Pure read of historical attendance with immutable snapshots.
         STRICT REQUIREMENT: Absolutely NO silent automatic re-seeding of old sessions.
+        Reads exclusively from attendance snapshot fields.
         """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
@@ -209,13 +253,13 @@ class AttendanceManager:
         cursor.execute("""
         SELECT 
             s.id as staff_id, s.project_id, 
-            COALESCE(NULLIF(a.staff_name_snapshot, ''), s.name) as name,
+            COALESCE(NULLIF(a.staff_name_snapshot, ''), '[نامشخص]') as name,
             s.phone, 
-            COALESCE(NULLIF(a.unit_snapshot, ''), s.unit) as unit,
-            COALESCE(NULLIF(a.section_snapshot, ''), s.section) as section,
-            COALESCE(NULLIF(a.position_snapshot, ''), s.position) as position,
+            COALESCE(NULLIF(a.unit_snapshot, ''), '-') as unit,
+            COALESCE(NULLIF(a.section_snapshot, ''), '-') as section,
+            COALESCE(NULLIF(a.position_snapshot, ''), 'نیرو') as position,
             s.card_title, s.shift_time, 
-            COALESCE(NULLIF(a.gender_snapshot, ''), s.gender) as gender,
+            COALESCE(NULLIF(a.gender_snapshot, ''), '') as gender,
             s.notes as staff_notes,
             s.is_multi_section, s._excel_row, s.staff_code,
             s.start_session_id, s.end_session_id,
@@ -307,13 +351,13 @@ class AttendanceManager:
         cursor.execute("""
         SELECT 
             s.id as staff_id, s.project_id, 
-            COALESCE(NULLIF(a.staff_name_snapshot, ''), s.name) as name,
+            COALESCE(NULLIF(a.staff_name_snapshot, ''), '[نامشخص]') as name,
             s.phone, 
-            COALESCE(NULLIF(a.unit_snapshot, ''), s.unit) as unit,
-            COALESCE(NULLIF(a.section_snapshot, ''), s.section) as section,
-            COALESCE(NULLIF(a.position_snapshot, ''), s.position) as position,
+            COALESCE(NULLIF(a.unit_snapshot, ''), '-') as unit,
+            COALESCE(NULLIF(a.section_snapshot, ''), '-') as section,
+            COALESCE(NULLIF(a.position_snapshot, ''), 'نیرو') as position,
             s.card_title, s.shift_time, 
-            COALESCE(NULLIF(a.gender_snapshot, ''), s.gender) as gender,
+            COALESCE(NULLIF(a.gender_snapshot, ''), '') as gender,
             s.notes as staff_notes,
             s.is_multi_section, s._excel_row, s.staff_code,
             s.start_session_id, s.end_session_id,
@@ -330,12 +374,6 @@ class AttendanceManager:
         return dict(row) if row else None
 
     def update_attendance_status(self, project_id, session_id, staff_id, status_val, actor_user_id=None, sync_same_phone=True):
-        """
-        Updates attendance status.
-        Verifies authorization (including session roster enrollment).
-        Strict phone sync (P0): ONLY syncs staff who already have an active attendance record in THIS session.
-        Uses UPDATE so no unauthorized staff can ever be dynamically injected into a session.
-        """
         if actor_user_id is not None:
             allowed, reason, _ = permission_manager.authorize_attendance_action(
                 actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="update_attendance"
@@ -392,12 +430,6 @@ class AttendanceManager:
             conn.close()
 
     def update_card_status(self, project_id, session_id, staff_id, card_val, actor_user_id=None, sync_same_phone=True):
-        """
-        Updates card status.
-        Verifies authorization (including session roster enrollment).
-        Strict phone sync (P0): ONLY syncs staff who already have an active attendance record in THIS session.
-        Uses UPDATE so no unauthorized staff can ever be dynamically injected into a session.
-        """
         if actor_user_id is not None:
             allowed, reason, _ = permission_manager.authorize_attendance_action(
                 actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="update_card"

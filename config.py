@@ -47,13 +47,13 @@ DEFAULT_SQLITE_PATH = os.getenv("SQLITE_PATH", os.path.join(DATA_DIR, "bot_cache
 
 BALE_API_URL = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot{0}/{1}")
 BALE_FILE_URL = os.getenv("BALE_FILE_URL", "https://tapi.bale.ai/file/bot{0}/{1}")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "314833444:Jd9ItAiRdjGeudweNCLnUXk-H8o5Yy5DR90")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 MYSQL_ENABLED = os.getenv("MYSQL_ENABLED", "0") == "1"
-MYSQL_HOST = os.getenv("MYSQL_HOST", "bonyad.flowplanner.ir")
-MYSQL_USER = os.getenv("MYSQL_USER", "flowpla1_fazele")
-MYSQL_PASS = os.getenv("MYSQL_PASS", "270z7hIeEI[s)kF~")
-MYSQL_DB = os.getenv("MYSQL_DB", "flowpla1_bonyad")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_USER = os.getenv("MYSQL_USER", "")
+MYSQL_PASS = os.getenv("MYSQL_PASS", "")
+MYSQL_DB = os.getenv("MYSQL_DB", "")
 MYSQL_TIMEOUT = int(os.getenv("MYSQL_TIMEOUT", "5"))
 
 DEFAULT_SUPER_ADMINS = [1129742448, 541843838]

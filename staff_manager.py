@@ -1,5 +1,7 @@
 import os
 import sys
+import logging
+from datetime import datetime
 from db_manager import db_instance
 from utils import normalize_persian
 
@@ -10,26 +12,55 @@ class StaffManager:
     def add_staff_member(self, project_id, name, phone="", unit="", section="", position='نیرو', 
                          card_title=None, shift_time='', gender='', notes='', 
                          is_multi_section='خیر', excel_row=None, staff_code=None,
-                         start_session_id=None, end_session_id=None):
+                         start_session_id=None, end_session_id=None, schedule_id=None):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         c_title = card_title if card_title is not None else section
+        clean_code = str(staff_code).strip() if staff_code else None
+
+        # If clean_code exists, verify if staff already exists in this project
+        if clean_code:
+            cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, clean_code))
+            existing = cursor.fetchone()
+            if existing:
+                staff_id = existing['id']
+                cursor.execute("""
+                UPDATE project_staff SET
+                    name = ?, phone = COALESCE(NULLIF(?, ''), phone),
+                    unit = ?, section = ?, position = ?,
+                    card_title = ?, shift_time = COALESCE(NULLIF(?, ''), shift_time),
+                    gender = COALESCE(NULLIF(?, ''), gender),
+                    notes = COALESCE(NULLIF(?, ''), notes),
+                    is_active = 1
+                WHERE id = ?
+                """, (name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), position.strip(),
+                      str(c_title).strip(), str(shift_time or '').strip(), gender.strip(), notes.strip(), staff_id))
+                conn.commit()
+                if schedule_id:
+                    self.assign_staff_to_schedule(schedule_id, staff_id, start_session_id, end_session_id)
+                conn.close()
+                return staff_id
+
         cursor.execute("""
         INSERT INTO project_staff 
         (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, is_active, notes, is_multi_section, start_session_id, end_session_id, _excel_row)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-        """, (project_id, staff_code, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
+        """, (project_id, clean_code, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
               position.strip(), str(c_title).strip(), str(shift_time or '').strip(), 
               gender.strip(), notes.strip(), is_multi_section, start_session_id, end_session_id, excel_row))
         staff_id = cursor.lastrowid
 
-        # If staff_code was not provided, auto-assign a deterministic code STF-<id:05d>
-        if not staff_code:
+        # If staff_code was not provided, auto-assign deterministic code STF-<id:05d>
+        if not clean_code:
             auto_code = f"STF-{staff_id:05d}"
             cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
 
         conn.commit()
         conn.close()
+
+        if schedule_id:
+            self.assign_staff_to_schedule(schedule_id, staff_id, start_session_id, end_session_id)
+
         return staff_id
 
     def get_staff_member(self, staff_id):
@@ -50,9 +81,76 @@ class StaffManager:
         conn.close()
         return dict(row) if row else None
 
-    def list_staff(self, project_id, unit=None, section=None, session_id=None, active_only=True):
+    def assign_staff_to_schedule(self, schedule_id, staff_id, start_session_id=None, end_session_id=None):
+        """Explicitly assigns a staff member to a specific schedule / class / level."""
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
+        now_iso = datetime.now().isoformat()
+        cursor.execute("""
+        INSERT INTO schedule_staff (schedule_id, staff_id, start_session_id, end_session_id, is_active, created_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+        ON CONFLICT(schedule_id, staff_id) DO UPDATE SET
+            start_session_id = COALESCE(excluded.start_session_id, schedule_staff.start_session_id),
+            end_session_id = excluded.end_session_id,
+            is_active = 1
+        """, (schedule_id, staff_id, start_session_id, end_session_id, now_iso))
+        conn.commit()
+        conn.close()
+        return True
+
+    def remove_staff_from_schedule(self, schedule_id, staff_id, end_session_id=None):
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        if end_session_id is not None:
+            cursor.execute("""
+            UPDATE schedule_staff SET end_session_id = ? WHERE schedule_id = ? AND staff_id = ?
+            """, (end_session_id, schedule_id, staff_id))
+        else:
+            cursor.execute("""
+            UPDATE schedule_staff SET is_active = 0 WHERE schedule_id = ? AND staff_id = ?
+            """, (schedule_id, staff_id))
+        conn.commit()
+        conn.close()
+        return True
+
+    def list_schedule_staff(self, schedule_id, session_id=None, active_only=True):
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        query = """
+        SELECT ps.*, ss.start_session_id as sched_start_session, ss.end_session_id as sched_end_session
+        FROM schedule_staff ss
+        JOIN project_staff ps ON ss.staff_id = ps.id
+        WHERE ss.schedule_id = ?
+        """
+        params = [schedule_id]
+        if active_only:
+            query += " AND ss.is_active = 1 AND ps.is_active = 1"
+        if session_id is not None:
+            query += " AND (ss.start_session_id IS NULL OR ss.start_session_id <= ?) AND (ss.end_session_id IS NULL OR ss.end_session_id >= ?)"
+            params.extend([session_id, session_id])
+        query += " ORDER BY ps.id ASC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def list_staff(self, project_id, unit=None, section=None, session_id=None, schedule_id=None, active_only=True):
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        
+        # If schedule_id is provided and that schedule has explicit schedule_staff assignments
+        if schedule_id is not None:
+            cursor.execute("SELECT COUNT(*) FROM schedule_staff WHERE schedule_id = ? AND is_active = 1", (schedule_id,))
+            cnt = cursor.fetchone()[0]
+            if cnt > 0:
+                conn.close()
+                s_list = self.list_schedule_staff(schedule_id, session_id=session_id, active_only=active_only)
+                if unit:
+                    s_list = [s for s in s_list if s.get('unit') == unit]
+                if section:
+                    s_list = [s for s in s_list if s.get('section') == section]
+                return s_list
+
         query = "SELECT * FROM project_staff WHERE project_id = ?"
         params = [project_id]
         if active_only:
@@ -72,8 +170,8 @@ class StaffManager:
         conn.close()
         return [dict(r) for r in rows]
 
-    def search_staff(self, project_id, query_str, active_only=True, session_id=None):
-        all_staff = self.list_staff(project_id, active_only=active_only, session_id=session_id)
+    def search_staff(self, project_id, query_str, active_only=True, session_id=None, schedule_id=None):
+        all_staff = self.list_staff(project_id, active_only=active_only, session_id=session_id, schedule_id=schedule_id)
         clean_q = normalize_persian(query_str)
         if not clean_q:
             return all_staff
@@ -124,7 +222,8 @@ class StaffManager:
                 cursor.execute(f"UPDATE project_staff SET {field_name} = ? WHERE id = ?", (value, staff_id))
             conn.commit()
             return True
-        except Exception:
+        except Exception as e:
+            logging.error(f"update_staff_field error: {e}")
             return False
         finally:
             conn.close()

@@ -24,6 +24,7 @@ from datetime import datetime
 from db_manager import db_instance
 from utils import calculate_status_with_delay, format_delay_minutes
 from staff_manager import staff_manager
+from permission_manager import permission_manager
 
 class AttendanceManager:
     def __init__(self, db=db_instance):
@@ -52,29 +53,12 @@ class AttendanceManager:
     def create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
                        schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
         """
-        Creates a session.
-        If schedule_id is provided, checks previous sessions specifically for that schedule.
-        Takes an immutable operational snapshot of the eligible active roster at session creation.
+        Creates a session strictly owned by its schedule if provided.
+        Seeds eligible staff roster at creation time and creates immutable historical snapshot.
         """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         
-        # 1. Look up previous session for this schedule if specified, else for the project
-        if schedule_id:
-            cursor.execute("""
-            SELECT id FROM sessions 
-            WHERE project_id = ? AND schedule_id = ? 
-            ORDER BY session_date DESC, id DESC LIMIT 1
-            """, (project_id, schedule_id))
-        else:
-            cursor.execute("""
-            SELECT id FROM sessions 
-            WHERE project_id = ? 
-            ORDER BY session_date DESC, id DESC LIMIT 1
-            """, (project_id,))
-        prev_row = cursor.fetchone()
-        prev_sid = prev_row['id'] if prev_row else None
-
         now_iso = datetime.now().isoformat()
         date_str = session_date or datetime.now().strftime("%Y-%m-%d")
 
@@ -85,18 +69,34 @@ class AttendanceManager:
         session_id = cursor.lastrowid
         conn.commit()
 
-        # 2. Populate session roster with staff lifecycle check and historical snapshot
-        # Eligible staff are active staff for this project whose start_session_id <= session_id (or NULL)
-        # and end_session_id >= session_id (or NULL)
-        cursor.execute("""
-        SELECT id, name, unit, section, position, gender 
-        FROM project_staff 
-        WHERE project_id = ? AND is_active = 1
-          AND (start_session_id IS NULL OR start_session_id <= ?)
-          AND (end_session_id IS NULL OR end_session_id >= ?)
-        ORDER BY id ASC
-        """, (project_id, session_id, session_id))
-        eligible_staff = cursor.fetchall()
+        # Determine eligible staff for this session:
+        # If schedule_id is provided and schedule has explicit staff in schedule_staff, use them.
+        # Otherwise fallback to active project staff whose lifecycle encompasses session_id.
+        eligible_staff = []
+        if schedule_id is not None:
+            cursor.execute("""
+            SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender
+            FROM schedule_staff ss
+            JOIN project_staff ps ON ss.staff_id = ps.id
+            WHERE ss.schedule_id = ? AND ss.is_active = 1 AND ps.is_active = 1
+              AND (ss.start_session_id IS NULL OR ss.start_session_id <= ?)
+              AND (ss.end_session_id IS NULL OR ss.end_session_id >= ?)
+              AND (ps.start_session_id IS NULL OR ps.start_session_id <= ?)
+              AND (ps.end_session_id IS NULL OR ps.end_session_id >= ?)
+            ORDER BY ps.id ASC
+            """, (schedule_id, session_id, session_id, session_id, session_id))
+            eligible_staff = cursor.fetchall()
+
+        if not eligible_staff:
+            cursor.execute("""
+            SELECT id, name, unit, section, position, gender 
+            FROM project_staff 
+            WHERE project_id = ? AND is_active = 1
+              AND (start_session_id IS NULL OR start_session_id <= ?)
+              AND (end_session_id IS NULL OR end_session_id >= ?)
+            ORDER BY id ASC
+            """, (project_id, session_id, session_id))
+            eligible_staff = cursor.fetchall()
 
         for s in eligible_staff:
             cursor.execute("""
@@ -115,7 +115,6 @@ class AttendanceManager:
         conn.commit()
         conn.close()
 
-        # 3. Synchronize Excel sheet if requested
         if sync_excel_sheet:
             try:
                 from excel_manager import excel_manager
@@ -180,42 +179,11 @@ class AttendanceManager:
 
     def get_session_attendance(self, project_id, session_id):
         """
-        Retrieves attendance with historical snapshots preserved.
-        If a session has no attendance rows yet (legacy session), automatically seeds them.
+        Pure read of historical attendance with immutable snapshots.
+        STRICT REQUIREMENT: Absolutely NO silent automatic re-seeding of old sessions.
         """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-
-        # Check if attendance rows exist for this session
-        cursor.execute("SELECT COUNT(*) FROM attendance WHERE project_id = ? AND session_id = ?", (project_id, session_id))
-        cnt_row = cursor.fetchone()
-        if not cnt_row or cnt_row[0] == 0:
-            # Auto-seed attendance for this session
-            now_iso = datetime.now().isoformat()
-            cursor.execute("""
-            SELECT id, name, unit, section, position, gender 
-            FROM project_staff 
-            WHERE project_id = ? AND is_active = 1
-              AND (start_session_id IS NULL OR start_session_id <= ?)
-              AND (end_session_id IS NULL OR end_session_id >= ?)
-            ORDER BY id ASC
-            """, (project_id, session_id, session_id))
-            eligible_staff = cursor.fetchall()
-            for s in eligible_staff:
-                cursor.execute("""
-                INSERT INTO attendance (
-                    project_id, session_id, staff_id, status, card_status,
-                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
-                    updated_at
-                )
-                VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
-                """, (
-                    project_id, session_id, s['id'],
-                    s['name'], s['unit'], s['section'], s['position'], s['gender'],
-                    now_iso
-                ))
-            conn.commit()
 
         cursor.execute("""
         SELECT 
@@ -244,6 +212,74 @@ class AttendanceManager:
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    def seed_session_roster_explicit(self, project_id, session_id, actor_user_id):
+        """
+        Explicit admin-only tool to seed or re-seed an empty session if authorized.
+        Prevents unauthorized or implicit mutation of historical records.
+        """
+        allowed, reason, role = permission_manager.authorize_attendance_action(
+            actor_user_id, project_id, session_id=session_id, action="manage_project"
+        )
+        if not allowed or role not in ('super_admin', 'admin'):
+            logging.warning(f"Explicit re-seed denied for {actor_user_id}: {reason}")
+            return False, "دسترسی فقط برای مدیران پروژه مجاز است"
+
+        sess = self.get_session(session_id)
+        if not sess:
+            return False, "جلسه یافت نشد"
+
+        schedule_id = sess.get('schedule_id')
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        now_iso = datetime.now().isoformat()
+
+        eligible_staff = []
+        if schedule_id is not None:
+            cursor.execute("""
+            SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender
+            FROM schedule_staff ss
+            JOIN project_staff ps ON ss.staff_id = ps.id
+            WHERE ss.schedule_id = ? AND ss.is_active = 1 AND ps.is_active = 1
+              AND (ss.start_session_id IS NULL OR ss.start_session_id <= ?)
+              AND (ss.end_session_id IS NULL OR ss.end_session_id >= ?)
+              AND (ps.start_session_id IS NULL OR ps.start_session_id <= ?)
+              AND (ps.end_session_id IS NULL OR ps.end_session_id >= ?)
+            ORDER BY ps.id ASC
+            """, (schedule_id, session_id, session_id, session_id, session_id))
+            eligible_staff = cursor.fetchall()
+
+        if not eligible_staff:
+            cursor.execute("""
+            SELECT id, name, unit, section, position, gender 
+            FROM project_staff 
+            WHERE project_id = ? AND is_active = 1
+              AND (start_session_id IS NULL OR start_session_id <= ?)
+              AND (end_session_id IS NULL OR end_session_id >= ?)
+            ORDER BY id ASC
+            """, (project_id, session_id, session_id))
+            eligible_staff = cursor.fetchall()
+
+        added_cnt = 0
+        for s in eligible_staff:
+            cursor.execute("""
+            INSERT INTO attendance (
+                project_id, session_id, staff_id, status, card_status,
+                staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                updated_at
+            )
+            VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
+            """, (
+                project_id, session_id, s['id'],
+                s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                now_iso
+            ))
+            added_cnt += cursor.rowcount
+
+        conn.commit()
+        conn.close()
+        return True, f"{added_cnt} رکورد کادر با موفقیت افزوده شد"
 
     def get_staff_session_attendance(self, project_id, session_id, staff_id):
         conn = self.db.get_sqlite_connection()
@@ -275,8 +311,9 @@ class AttendanceManager:
 
     def update_attendance_status(self, project_id, session_id, staff_id, status_val, actor_user_id=None, sync_same_phone=True):
         if actor_user_id is not None:
-            from permission_manager import permission_manager
-            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            allowed, reason, _ = permission_manager.authorize_attendance_action(
+                actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="update_attendance"
+            )
             if not allowed:
                 logging.warning(f"update_attendance_status denied for actor {actor_user_id} on staff {staff_id}: {reason}")
                 return False
@@ -289,12 +326,25 @@ class AttendanceManager:
 
         target_staff_ids = [staff_id]
         phone = str(staff.get("phone", "")).strip()
-        if sync_same_phone and phone and phone not in ("None", "-", ""):
-            phone_staff = staff_manager.list_staff(project_id, active_only=True)
-            target_staff_ids = [s["id"] for s in phone_staff if str(s.get("phone", "")).strip() == phone]
 
+        # Strict phone synchronization boundary: ONLY same project AND same session AND valid attendance record
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
+
+        if sync_same_phone and phone and phone not in ("None", "-", ""):
+            cursor.execute("""
+            SELECT s.id 
+            FROM project_staff s
+            WHERE s.project_id = ? AND s.phone = ? AND s.is_active = 1
+              AND (s.start_session_id IS NULL OR s.start_session_id <= ?)
+              AND (s.end_session_id IS NULL OR s.end_session_id >= ?)
+            """, (project_id, phone, session_id, session_id))
+            matched = [r[0] for r in cursor.fetchall()]
+            if matched:
+                target_staff_ids = matched
+            if staff_id not in target_staff_ids:
+                target_staff_ids.append(staff_id)
+
         now_iso = datetime.now().isoformat()
         try:
             for s_id in target_staff_ids:
@@ -328,8 +378,9 @@ class AttendanceManager:
 
     def update_card_status(self, project_id, session_id, staff_id, card_val, actor_user_id=None, sync_same_phone=True):
         if actor_user_id is not None:
-            from permission_manager import permission_manager
-            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            allowed, reason, _ = permission_manager.authorize_attendance_action(
+                actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="update_card"
+            )
             if not allowed:
                 logging.warning(f"update_card_status denied for actor {actor_user_id} on staff {staff_id}: {reason}")
                 return False
@@ -337,14 +388,28 @@ class AttendanceManager:
         staff = staff_manager.get_staff_member(staff_id)
         if not staff:
             return False
+
         target_staff_ids = [staff_id]
         phone = str(staff.get("phone", "")).strip()
-        if sync_same_phone and phone and phone not in ("None", "-", ""):
-            phone_staff = staff_manager.list_staff(project_id, active_only=True)
-            target_staff_ids = [s["id"] for s in phone_staff if str(s.get("phone", "")).strip() == phone]
 
+        # Strict phone synchronization boundary: ONLY same project AND same session AND valid attendance record
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
+
+        if sync_same_phone and phone and phone not in ("None", "-", ""):
+            cursor.execute("""
+            SELECT s.id 
+            FROM project_staff s
+            WHERE s.project_id = ? AND s.phone = ? AND s.is_active = 1
+              AND (s.start_session_id IS NULL OR s.start_session_id <= ?)
+              AND (s.end_session_id IS NULL OR s.end_session_id >= ?)
+            """, (project_id, phone, session_id, session_id))
+            matched = [r[0] for r in cursor.fetchall()]
+            if matched:
+                target_staff_ids = matched
+            if staff_id not in target_staff_ids:
+                target_staff_ids.append(staff_id)
+
         now_iso = datetime.now().isoformat()
         try:
             for s_id in target_staff_ids:
@@ -378,8 +443,9 @@ class AttendanceManager:
 
     def add_late_tracking(self, project_id, session_id, staff_id, note, actor_user_id=None):
         if actor_user_id is not None:
-            from permission_manager import permission_manager
-            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            allowed, reason, _ = permission_manager.authorize_attendance_action(
+                actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="add_late"
+            )
             if not allowed:
                 logging.warning(f"add_late_tracking denied for actor {actor_user_id} on staff {staff_id}: {reason}")
                 return False
@@ -410,8 +476,9 @@ class AttendanceManager:
 
     def add_description(self, project_id, session_id, staff_id, note, actor_user_id=None):
         if actor_user_id is not None:
-            from permission_manager import permission_manager
-            allowed, reason, _ = permission_manager.check_staff_access(project_id, actor_user_id, staff_id)
+            allowed, reason, _ = permission_manager.authorize_attendance_action(
+                actor_user_id, project_id, session_id=session_id, staff_id=staff_id, action="edit_desc"
+            )
             if not allowed:
                 logging.warning(f"add_description denied for actor {actor_user_id} on staff {staff_id}: {reason}")
                 return False

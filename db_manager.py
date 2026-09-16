@@ -26,11 +26,11 @@ except ImportError:
     logging.warning("pymysql is not installed. Remote MySQL sync will be skipped.")
 
 class DatabaseUnavailableError(Exception):
-    """Raised when the primary database cannot be reached or locked."""
+    """Raised when the primary database cannot be reached, locked, or unavailable."""
     pass
 
 class DatabaseManager:
-    CURRENT_SCHEMA_VERSION = 6
+    CURRENT_SCHEMA_VERSION = 7
 
     def __init__(self, db_path=DEFAULT_SQLITE_PATH):
         self.db_path = db_path
@@ -40,7 +40,7 @@ class DatabaseManager:
         self.setup_database()
 
     def _init_db_path(self):
-        """Tests if db_path is on a lock-supporting filesystem, else uses safe dedicated fallback."""
+        """Initializes database path safely. Detects unsupported locking filesystems upfront."""
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
             test_conn = sqlite3.connect(self.db_path, timeout=5.0)
@@ -210,7 +210,23 @@ class DatabaseManager:
             )
             """)
 
-            # 8. Attendance with immutable historical snapshots
+            # 8. Schedule Staff (Intermediate table for class/schedule-level staff segregation)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_staff (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL,
+                staff_id INTEGER NOT NULL,
+                start_session_id INTEGER,
+                end_session_id INTEGER,
+                is_active BOOLEAN DEFAULT 1,
+                created_at TEXT,
+                UNIQUE(schedule_id, staff_id),
+                FOREIGN KEY(schedule_id) REFERENCES schedules(id) ON DELETE CASCADE,
+                FOREIGN KEY(staff_id) REFERENCES project_staff(id) ON DELETE CASCADE
+            )
+            """)
+
+            # 9. Attendance with immutable historical snapshots
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,7 +250,7 @@ class DatabaseManager:
             )
             """)
 
-            # 9. Shortages
+            # 10. Shortages
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS shortages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -255,7 +271,7 @@ class DatabaseManager:
             )
             """)
 
-            # 10. Staff Logs
+            # 11. Staff Logs
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS staff_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,7 +283,7 @@ class DatabaseManager:
             )
             """)
 
-            # 11. User Context
+            # 12. User Context
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_context (
                 user_id INTEGER PRIMARY KEY,
@@ -277,7 +293,7 @@ class DatabaseManager:
             )
             """)
 
-            # 12. Operator Daily Absence
+            # 13. Operator Daily Absence
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS operator_daily_absence (
                 project_id INTEGER NOT NULL,
@@ -297,7 +313,8 @@ class DatabaseManager:
             indexes = [
                 ("idx_staff_project_active", "project_staff (project_id, is_active)"),
                 ("idx_staff_project_phone", "project_staff (project_id, phone)"),
-                ("idx_staff_code", "project_staff (project_id, staff_code)"),
+                ("uidx_project_staff_code", "project_staff (project_id, staff_code) WHERE staff_code IS NOT NULL AND staff_code != ''"),
+                ("idx_schedule_staff_lookup", "schedule_staff (schedule_id, staff_id, is_active)"),
                 ("idx_attendance_lookup", "attendance (project_id, session_id, staff_id)"),
                 ("idx_sessions_project", "sessions (project_id)"),
                 ("idx_sessions_sched_date", "sessions (project_id, schedule_id, session_date)"),
@@ -309,8 +326,9 @@ class DatabaseManager:
             for idx_name, idx_def in indexes:
                 try:
                     cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
-                except Exception:
-                    pass
+                except sqlite3.OperationalError as op_err:
+                    if "already exists" not in str(op_err):
+                        logging.warning(f"Index creation warning {idx_name}: {op_err}")
 
             # Seed default global super admins
             now_iso = datetime.now().isoformat()
@@ -333,7 +351,6 @@ class DatabaseManager:
         now_iso = datetime.now().isoformat()
 
         all_col_migrations = [
-            # v1 -> basic cols
             ("users", "staff_name", "TEXT DEFAULT ''"),
             ("users", "gender", "TEXT DEFAULT 'خانم'"),
             ("users", "is_global_super_admin", "BOOLEAN DEFAULT 0"),
@@ -374,7 +391,6 @@ class DatabaseManager:
             ("project_staff", "notes", "TEXT DEFAULT ''"),
             ("project_staff", "is_multi_section", "TEXT DEFAULT 'خیر'"),
             ("project_staff", "_excel_row", "INTEGER"),
-            # v2 -> shortage enhancements
             ("shortages", "count", "INTEGER DEFAULT 1"),
             ("shortages", "target_group", "TEXT DEFAULT 'عمومی'"),
             ("shortages", "description", "TEXT DEFAULT ''"),
@@ -385,25 +401,24 @@ class DatabaseManager:
             ("shortages", "requested_by", "INTEGER"),
             ("shortages", "_excel_row", "INTEGER"),
             ("shortages", "created_at", "TEXT"),
-            # v3 -> staff code & lifecycle
             ("project_staff", "staff_code", "TEXT"),
             ("project_staff", "start_session_id", "INTEGER"),
             ("project_staff", "end_session_id", "INTEGER"),
-            # v4 -> attendance historical snapshots
             ("attendance", "staff_name_snapshot", "TEXT"),
             ("attendance", "unit_snapshot", "TEXT"),
             ("attendance", "section_snapshot", "TEXT"),
             ("attendance", "position_snapshot", "TEXT"),
             ("attendance", "gender_snapshot", "TEXT"),
-            # v5 -> org chart display order
-            ("org_chart", "display_order", "INTEGER DEFAULT 0"),
+            ("org_chart", "display_order", "INTEGER DEFAULT 0")
         ]
 
         for tbl, col, col_def in all_col_migrations:
             try:
                 cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
-            except Exception:
-                pass
+            except sqlite3.OperationalError as op_err:
+                # Column duplicate is standard safe ignore in SQLite
+                if "duplicate column name" not in str(op_err):
+                    logging.warning(f"Migration notice for {tbl}.{col}: {op_err}")
 
         if current_v < self.CURRENT_SCHEMA_VERSION:
             cursor.execute("""
@@ -412,8 +427,23 @@ class DatabaseManager:
             """, (self.CURRENT_SCHEMA_VERSION, now_iso))
             logging.info(f"Database schema upgraded to version {self.CURRENT_SCHEMA_VERSION}")
 
+    def verify_backup_integrity(self, backup_path):
+        """Runs PRAGMA integrity_check on the backed-up database to confirm zero corruption."""
+        if not os.path.exists(backup_path):
+            return False
+        try:
+            chk_conn = sqlite3.connect(backup_path, timeout=10.0)
+            chk_cur = chk_conn.cursor()
+            chk_cur.execute("PRAGMA integrity_check")
+            rows = chk_cur.fetchall()
+            chk_conn.close()
+            return len(rows) == 1 and rows[0][0] == "ok"
+        except Exception as e:
+            logging.error(f"Backup integrity check failed for {backup_path}: {e}")
+            return False
+
     def backup_database(self, label="auto"):
-        """Safe SQLite online backup utilizing sqlite3.Connection.backup API with retention."""
+        """Safe SQLite online backup utilizing sqlite3.Connection.backup API with integrity check & retention."""
         with self.lock:
             try:
                 if not os.path.exists(self.active_db_path):
@@ -431,6 +461,14 @@ class DatabaseManager:
                     source_conn.backup(dest_conn)
                 dest_conn.close()
                 source_conn.close()
+
+                # Verify integrity of backup before moving to permanent archive
+                if not self.verify_backup_integrity(temp_target):
+                    if os.path.exists(temp_target):
+                        os.remove(temp_target)
+                    logging.error(f"Integrity check failed on backup {temp_target}. Aborting backup.")
+                    return None
+
                 shutil.move(temp_target, target_path)
 
                 # Retention policy: keep last 15 backups per category
@@ -445,10 +483,25 @@ class DatabaseManager:
                 except Exception:
                     pass
 
-                logging.info(f"Database safe online backup created: {target_path}")
+                logging.info(f"Database safe verified online backup created: {target_path}")
                 return target_path
             except Exception as e:
                 logging.error(f"Backup failed: {e}")
                 return None
+
+    def restore_backup(self, backup_path, destination_path=None):
+        """Restores database from a verified backup."""
+        if not self.verify_backup_integrity(backup_path):
+            raise ValueError(f"Cannot restore from corrupt or invalid backup: {backup_path}")
+        dest = destination_path or self.active_db_path
+        with self.lock:
+            src_conn = sqlite3.connect(backup_path)
+            dest_conn = sqlite3.connect(dest)
+            with dest_conn:
+                src_conn.backup(dest_conn)
+            src_conn.close()
+            dest_conn.close()
+            logging.info(f"Successfully restored database to {dest} from {backup_path}")
+            return True
 
 db_instance = DatabaseManager()

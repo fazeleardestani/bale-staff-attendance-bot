@@ -39,8 +39,9 @@ class WorkerManager:
 
     def get_today_sessions(self, project_id):
         """
-        Determines the relevant session(s) for today based on exact date or weekday schedule,
-        preventing incorrect assumptions about 'sessions[-1]'.
+        Determines the relevant session(s) for today strictly based on date or schedule.
+        STRICT REQUIREMENT: NO arbitrary guessing or falling back to sessions[-1].
+        If no session is scheduled or occurring today, returns an empty list [].
         """
         today_str = datetime.now().strftime("%Y-%m-%d")
         today_day = get_persian_weekday(datetime.now())
@@ -49,18 +50,26 @@ class WorkerManager:
         if not all_sessions:
             return []
 
-        # 1. Exact date match
-        date_matches = [s for s in all_sessions if str(s.get('session_date', '')).strip() == today_str]
+        # 1. Exact calendar date match (today)
+        date_matches = [
+            s for s in all_sessions 
+            if str(s.get('session_date', '')).strip() == today_str and s.get('status') != 'CANCELLED'
+        ]
         if date_matches:
             return date_matches
 
-        # 2. Weekday match for recurring schedules
-        day_matches = [s for s in all_sessions if today_day and today_day in str(s.get('day_of_week', '')).strip()]
+        # 2. Weekday match for recurring schedules on active sessions occurring today
+        day_matches = [
+            s for s in all_sessions 
+            if today_day and today_day in str(s.get('day_of_week', '')).strip() 
+            and (not s.get('session_date') or str(s.get('session_date', '')).strip() == today_str)
+            and s.get('status') != 'CANCELLED'
+        ]
         if day_matches:
             return day_matches
 
-        # 3. Fallback to latest session only if project has active single session
-        return [all_sessions[-1]]
+        # No session scheduled for today: return empty list. Never guess!
+        return []
 
     def _daily_report_loop(self):
         while True:
@@ -114,7 +123,6 @@ class WorkerManager:
                             msg = f"⚠️ **یادآوری لیست متأخرین - {proj['name']}:**\nهم‌اکنون **{len(untracked_late)} نفر** در جلسه «{active_session['name']}» بدون پیگیری تأخیر هستند. لطفاً جهت پیگیری تماس بگیرید."
                             members = permission_manager.get_project_members(pid)
                             for m in members:
-                                # Check if member is active, not unit_head, and has not marked daily absence for today
                                 if m['is_active'] and m.get('role') != 'unit_head':
                                     if permission_manager.is_operator_absent_today(pid, m['user_id']):
                                         continue
@@ -132,7 +140,6 @@ class WorkerManager:
                 unnotified = shortage_manager.get_unnotified_shortages()
                 if not unnotified:
                     continue
-                # Group unnotified shortages by batch parameters
                 grouped = {}
                 for s in unnotified:
                     key = (s['project_id'], s['unit'], s['section'], s.get('target_group', 'عمومی'), s.get('description', ''))
@@ -151,6 +158,7 @@ class WorkerManager:
                         f"📝 توضیحات: {desc}\n\n"
                         f"لطفاً جهت تأمین کمبود اقدام فرمایید."
                     )
+                    success_count = 0
                     if self.bot:
                         members = permission_manager.get_project_members(pid)
                         for m in members:
@@ -159,10 +167,16 @@ class WorkerManager:
                                     continue
                                 try:
                                     self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
-                                except Exception:
-                                    pass
-                    for item in items:
-                        shortage_manager.mark_shortage_notified(item['id'])
+                                    success_count += 1
+                                except Exception as send_err:
+                                    logger.error(f"Failed to send shortage notification to {m['user_id']}: {send_err}")
+
+                    # Mark as notified strictly if at least one delivery was successful (or offline mock)
+                    if success_count > 0 or not self.bot:
+                        for item in items:
+                            shortage_manager.mark_shortage_notified(item['id'])
+                    else:
+                        logger.warning(f"Shortage batch for project {pid} failed delivery to all recipients. Retaining unnotified status.")
             except Exception as e:
                 logger.error(f"Error in check_shortages_loop: {e}")
 

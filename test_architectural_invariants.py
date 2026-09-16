@@ -5,7 +5,9 @@ import unittest
 import tempfile
 import shutil
 import openpyxl
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from config import EXCEL_BACKUPS_DIR
 
 sys.path.insert(0, '/working_dir/c_482d3e8b87a19f32')
 
@@ -491,6 +493,206 @@ class TestArchitecturalInvariants(unittest.TestCase):
             self.assertEqual(proj_ali['is_active'], 1, "Ali must remain active in project_staff!")
         finally:
             if os.path.exists(path): os.remove(path)
+
+
+    def test_19_historical_attendance_pure_snapshot_all_fields(self):
+        """P0: get_session_attendance reads all historical fields purely from attendance table with zero fallback."""
+        ts = int(time.time() * 1000)
+        pid = project_manager.create_project(f"Proj Hist Snapshot {ts}")
+        sched_id = attendance_manager.create_schedule(pid, "کلاس روزانه", "دوشنبه", "16:00")
+
+        staff_id = staff_manager.add_staff_member(
+            pid, "محمد رضایی", phone="09121112233", unit="رسانه", section="عکاسی",
+            position="سرپرست", card_title="کارت عکاسی", shift_time="08:00",
+            gender="آقا", is_multi_section="بله", staff_code="CODE-001", schedule_id=sched_id
+        )
+
+        sess_1 = attendance_manager.create_session(pid, "جلسه اول", session_date="2026-09-10", schedule_id=sched_id)
+        attendance_manager.update_attendance_status(pid, sess_1, staff_id, "حاضر")
+
+        # Now mutate current staff in project_staff: change phone, card_title, shift_time, unit, etc.
+        conn = db_instance.get_sqlite_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+        UPDATE project_staff 
+        SET phone = '09359998877', unit = 'روابط عمومی', card_title = 'کارت روابط عمومی',
+            shift_time = '14:00', name = 'محمد رضایی جدید'
+        WHERE id = ?
+        """, (staff_id,))
+        conn.commit()
+        conn.close()
+
+        # Read historical attendance: MUST return the snapshot from session 1, NOT current values
+        hist_att = attendance_manager.get_session_attendance(pid, sess_1)
+        self.assertEqual(len(hist_att), 1)
+        rec = hist_att[0]
+        self.assertEqual(rec['name'], "محمد رضایی")
+        self.assertEqual(rec['phone'], "09121112233")
+        self.assertEqual(rec['unit'], "رسانه")
+        self.assertEqual(rec['card_title'], "کارت عکاسی")
+        self.assertEqual(rec['shift_time'], "08:00")
+        self.assertEqual(rec['is_multi_section'], "بله")
+        self.assertEqual(rec['staff_code'], "CODE-001")
+
+    def test_20_class_project_smart_sessions_creates_exact_n_sessions_with_sequential_dates(self):
+        """P0: create_project_with_smart_sessions creates exactly N sessions with sequential weekly dates."""
+        ts = int(time.time() * 1000)
+        pid, first_sid = project_manager.create_project_with_smart_sessions(
+            name=f"کلاس حکمت سطح ۱ {ts}",
+            project_type="کلاس",
+            total_sessions=13,
+            recurring_days="یکشنبه",
+            activation_time="16:00",
+            start_date="2026-10-04"
+        )
+        sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
+        self.assertEqual(len(sessions), 13, f"Expected 13 sessions, got {len(sessions)}")
+        
+        # Verify sequential weekly dates
+        for idx, s in enumerate(sessions):
+            self.assertEqual(s['name'], f"جلسه {idx + 1}")
+            expected_date = (datetime(2026, 10, 4) + timedelta(days=7 * idx)).strftime("%Y-%m-%d")
+            self.assertEqual(s['session_date'], expected_date)
+
+    def test_21_worker_recurring_schedule_multi_week_matching(self):
+        """P1: Worker get_today_sessions accurately matches recurring scheduled sessions across dates."""
+        ts = int(time.time() * 1000)
+        pid = project_manager.create_project(f"Proj Worker Rec {ts}", project_type="کلاس")
+        sched_id = attendance_manager.create_schedule(pid, "کلاس هفتگی", "یکشنبه", "16:00")
+
+        s1 = attendance_manager.create_session(pid, "جلسه اول", session_date="2026-10-04", day_of_week="یکشنبه", schedule_id=sched_id)
+        s2 = attendance_manager.create_session(pid, "جلسه دوم", session_date="2026-10-11", day_of_week="یکشنبه", schedule_id=sched_id)
+
+        # Mock datetime in worker
+        from unittest.mock import patch
+        with patch('worker_manager.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 10, 4, 16, 0)
+            mock_dt.strftime = datetime.strftime
+            res1 = worker_manager.get_today_sessions(pid)
+            self.assertEqual(len(res1), 1)
+            self.assertEqual(res1[0]['id'], s1)
+
+        with patch('worker_manager.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 10, 11, 16, 0)
+            mock_dt.strftime = datetime.strftime
+            res2 = worker_manager.get_today_sessions(pid)
+            self.assertEqual(len(res2), 1)
+            self.assertEqual(res2[0]['id'], s2)
+
+        # Off day: no session
+        with patch('worker_manager.datetime') as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 10, 5, 16, 0)
+            mock_dt.strftime = datetime.strftime
+            res_off = worker_manager.get_today_sessions(pid)
+            self.assertEqual(len(res_off), 0)
+
+    def test_22_excel_import_class_sheet_without_schedule_fails_explicitly(self):
+        """P0: In a class project, an Excel sheet that does not match an active schedule fails import with clear error."""
+        ts = int(time.time() * 1000)
+        pid = project_manager.create_project(f"Class Proj Strict {ts}", project_type="کلاس")
+        attendance_manager.create_schedule(pid, "کلاس رسمی دوشنبه", "دوشنبه", "16:00")
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "کلاس طلایه حکمت بانوان" # Not matching "کلاس رسمی دوشنبه"
+        ws.append(["ردیف", "نام و نام خانوادگی", "واحد", "بخش"])
+        ws.append([1, "تست نام", "آموزش", "بخش ۱"])
+        path = f"/tmp/test_invalid_class_sheet_{ts}.xlsx"
+        wb.save(path)
+        wb.close()
+
+        with self.assertRaises(ValueError) as cm:
+            excel_manager.import_project_excel(pid, path)
+        self.assertIn("به هیچ برنامه (Schedule) فعال این پروژه متصل نیست", str(cm.exception))
+
+    def test_23_excel_backup_retention_strictly_per_project(self):
+        """P0: Excel backup retention cleans up strictly per-project, never deleting other projects' backups."""
+        ts = int(time.time() * 1000)
+        p1 = project_manager.create_project(f"Proj A {ts}")
+        p2 = project_manager.create_project(f"Proj B {ts}")
+
+        cat_dir = os.path.join(EXCEL_BACKUPS_DIR, f"test_ret_{ts}")
+        os.makedirs(cat_dir, exist_ok=True)
+
+        # Create 10 backups for Project B
+        for i in range(10):
+            with open(os.path.join(cat_dir, f"project_{p2}_backup_2026-09-16_10-00-{i:02d}.xlsx"), "wb") as f:
+                f.write(b"PK000")
+
+        # Create 20 backups for Project A
+        for i in range(20):
+            with open(os.path.join(cat_dir, f"project_{p1}_backup_2026-09-16_11-00-{i:02d}.xlsx"), "wb") as f:
+                f.write(b"PK000")
+
+        # Mock EXCEL_BACKUPS_DIR for testing retention
+        from unittest.mock import patch
+        with patch('excel_manager.EXCEL_BACKUPS_DIR', os.path.dirname(cat_dir)):
+            excel_manager.backup_project_excel(p1, label=f"test_ret_{ts}")
+
+        # Verify Project A now has <= 16 backups
+        p1_files = [f for f in os.listdir(cat_dir) if f.startswith(f"project_{p1}_backup_")]
+        self.assertLessEqual(len(p1_files), 16)
+
+        # Verify Project B STILL HAS ALL 10 BACKUPS intact!
+        p2_files = [f for f in os.listdir(cat_dir) if f.startswith(f"project_{p2}_backup_")]
+        self.assertEqual(len(p2_files), 10, "Project B backups were erroneously deleted by Project A cleanup!")
+
+    def test_24_schedule_staff_lifecycle_and_historical_isolation(self):
+        """P1: Verifies multi-session lifecycle (Sessions 1-5: A+B+C, Session 6: A+B, Session 7: A+B+D) maintains historical isolation."""
+        ts = int(time.time() * 1000)
+        pid = project_manager.create_project(f"Proj Lifecycle {ts}", project_type="کلاس")
+        sched_id = attendance_manager.create_schedule(pid, "کلاس تخصصی", "دوشنبه", "16:00")
+
+        # Staff A, B, C
+        s_a = staff_manager.add_staff_member(pid, "کادر الف", unit="آموزش", section="کلاس", schedule_id=sched_id)
+        s_b = staff_manager.add_staff_member(pid, "کادر ب", unit="آموزش", section="کلاس", schedule_id=sched_id)
+        s_c = staff_manager.add_staff_member(pid, "کادر ج", unit="آموزش", section="کلاس", schedule_id=sched_id)
+
+        # Sessions 1 to 5
+        s1 = attendance_manager.create_session(pid, "جلسه ۱", session_date="2026-09-01", schedule_id=sched_id)
+        s5 = attendance_manager.create_session(pid, "جلسه ۵", session_date="2026-09-29", schedule_id=sched_id)
+
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s1)}, {"کادر الف", "کادر ب", "کادر ج"})
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s5)}, {"کادر الف", "کادر ب", "کادر ج"})
+
+        # Session 6: C is removed
+        # Simulate Excel update for Session 6 containing only A and B
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "کلاس تخصصی"
+        headers = ["ردیف", "واحد", "بخش", "نام و نام خانوادگی", "سمت", "عنوان کارت", "شماره تماس", "ساعت حضور", "پیگیری تاخیر", "توضیحات", "وضعیت کارت", "وضعیت حضور", "جنسیت", "فعال در چند بخش؟"]
+        ws.append(headers)
+        ws.append([1, "آموزش", "کلاس", "کادر الف", "نیرو", "کلاس", "", "", "", "", "", "حاضر", "خانم", "خیر"])
+        ws.append([2, "آموزش", "کلاس", "کادر ب", "نیرو", "کلاس", "", "", "", "", "", "حاضر", "خانم", "خیر"])
+        path = f"/tmp/test_lifecycle_s6_{ts}.xlsx"
+        wb.save(path)
+        wb.close()
+        excel_manager.import_project_excel(pid, path)
+
+        s6 = attendance_manager.create_session(pid, "جلسه ۶", session_date="2026-10-06", schedule_id=sched_id)
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s6)}, {"کادر الف", "کادر ب"})
+
+        # Session 7: D is added
+        wb7 = openpyxl.Workbook()
+        ws7 = wb7.active
+        ws7.title = "کلاس تخصصی"
+        ws7.append(headers)
+        ws7.append([1, "آموزش", "کلاس", "کادر الف", "نیرو", "کلاس", "", "", "", "", "", "حاضر", "خانم", "خیر"])
+        ws7.append([2, "آموزش", "کلاس", "کادر ب", "نیرو", "کلاس", "", "", "", "", "", "حاضر", "خانم", "خیر"])
+        ws7.append([3, "آموزش", "کلاس", "کادر دال", "نیرو", "کلاس", "", "", "", "", "", "حاضر", "خانم", "خیر"])
+        path7 = f"/tmp/test_lifecycle_s7_{ts}.xlsx"
+        wb7.save(path7)
+        wb7.close()
+        excel_manager.import_project_excel(pid, path7)
+
+        s7 = attendance_manager.create_session(pid, "جلسه ۷", session_date="2026-10-13", schedule_id=sched_id)
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s7)}, {"کادر الف", "کادر ب", "کادر دال"})
+
+        # FINAL VERIFICATION: Historical Sessions 1 and 5 MUST STILL BE EXACTLY A + B + C
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s1)}, {"کادر الف", "کادر ب", "کادر ج"})
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s5)}, {"کادر الف", "کادر ب", "کادر ج"})
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s6)}, {"کادر الف", "کادر ب"})
+        self.assertEqual({r['name'] for r in attendance_manager.get_session_attendance(pid, s7)}, {"کادر الف", "کادر ب", "کادر دال"})
 
 if __name__ == '__main__':
     unittest.main()

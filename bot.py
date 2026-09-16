@@ -685,14 +685,17 @@ def handle_callbacks(call):
             if is_arch:
                 markup.add(types.InlineKeyboardButton("♻️ فعال‌سازی مجدد (خروج از آرشیو)", callback_data=f"unarchiveproj_{pid}"))
             else:
-                markup.add(types.InlineKeyboardButton("📁 آرشیو کردن پروژه", callback_data=f"archiveproj_{pid}"))
-            markup.add(types.InlineKeyboardButton("🗑 حذف کامل پروژه", callback_data=f"deleteproj_{pid}"))
+                markup.add(types.InlineKeyboardButton("📁 اتمام و آرشیو پروژه", callback_data=f"archiveproj_{pid}"))
+            if is_global:
+                markup.add(types.InlineKeyboardButton("🗑 حذف دائمی پروژه (فقط سوپر ادمین)", callback_data=f"deleteproj_{pid}"))
             markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی پروژه", callback_data="start_menu"))
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
         if data.startswith("deleteproj_"):
-            if role != "super_admin" and not is_global: return
+            if not is_global:
+                bot.answer_callback_query(call.id, "حذف کامل پروژه صرفاً در حیطه اختیارات مدیر ارشد کل سامانه است.", show_alert=True)
+                return
             target_pid = int(data.replace("deleteproj_", ""))
             proj = project_manager.get_project(target_pid)
             pname = proj['name'] if proj else f"پروژه {target_pid}"
@@ -710,7 +713,9 @@ def handle_callbacks(call):
             return
 
         if data.startswith("confirm_delproj_"):
-            if role != "super_admin" and not is_global: return
+            if not is_global:
+                bot.answer_callback_query(call.id, "دسترسی غیرمجاز برای حذف دائمی", show_alert=True)
+                return
             target_pid = int(data.replace("confirm_delproj_", ""))
             proj = project_manager.get_project(target_pid)
             pname = proj['name'] if proj else f"پروژه {target_pid}"
@@ -1598,7 +1603,7 @@ def handle_callbacks(call):
                 return
 
             role_db = "admin" if target_role == "admin" else "operator"
-            permission_manager.upsert_user(t_uid, name, gen, is_global_super_admin=0, is_active=1, is_hr_member=1 if role_db == 'admin' else 0)
+            permission_manager.upsert_user(t_uid, name, gen, is_global_super_admin=0, is_active=1, is_hr_member=1)
             permission_manager.set_project_user(pid_target, t_uid, role=role_db, gender=gen, is_active=1)
             role_fa = "مدیر پروژه (Admin)" if role_db == 'admin' else "اپراتور کادر (Operator)"
             log_action(chat_id, pid_target, "Add Project Member", f"User: {t_uid}, Name: {name}, Role: {role_db}, Gender: {gen}")
@@ -2075,6 +2080,8 @@ def finalize_add_staff(chat_id, gender):
     if not state or state.get('type') != 'add_staff': return
     pid = state['pid']; sid = state['sid']
     staff_id = staff_manager.add_staff_member(pid, state['name'], state['phone'], state['unit'], state['section'], gender=gender, notes="حین پروژه اضافه شده")
+    # Immediately add newly created staff to active session attendance roster
+    attendance_manager.add_staff_to_session_roster(pid, sid, [staff_id])
     attendance_manager.update_attendance_status(pid, sid, staff_id, "حاضر")
     log_action(chat_id, pid, "Add Staff", f"Name: {state['name']}, Unit: {state['unit']}, Sec: {state['section']}")
     bot.send_message(chat_id, f"✅ نیروی جدید با موفقیت ثبت شد و حضور ایشان برای جلسه فعال گردید.",

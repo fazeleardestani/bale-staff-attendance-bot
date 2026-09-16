@@ -22,7 +22,7 @@ class DatabaseUnavailableError(Exception):
     pass
 
 class DatabaseManager:
-    CURRENT_SCHEMA_VERSION = 7
+    CURRENT_SCHEMA_VERSION = 8
 
     def __init__(self, db_path=DEFAULT_SQLITE_PATH):
         self.db_path = db_path
@@ -233,6 +233,11 @@ class DatabaseManager:
                     section_snapshot TEXT,
                     position_snapshot TEXT,
                     gender_snapshot TEXT,
+                    phone_snapshot TEXT,
+                    card_title_snapshot TEXT,
+                    shift_time_snapshot TEXT,
+                    is_multi_section_snapshot TEXT,
+                    staff_code_snapshot TEXT,
                     updated_at TEXT,
                     UNIQUE(project_id, session_id, staff_id),
                     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -299,17 +304,6 @@ class DatabaseManager:
 
                 # Execute explicit schema migrations
                 self._apply_migrations(cursor)
-                # Legacy snapshot backfill migration
-                cursor.execute("""
-                UPDATE attendance
-                SET 
-                    staff_name_snapshot = COALESCE(NULLIF(staff_name_snapshot, ''), (SELECT name FROM project_staff WHERE id = attendance.staff_id)),
-                    unit_snapshot = COALESCE(NULLIF(unit_snapshot, ''), (SELECT unit FROM project_staff WHERE id = attendance.staff_id)),
-                    section_snapshot = COALESCE(NULLIF(section_snapshot, ''), (SELECT section FROM project_staff WHERE id = attendance.staff_id)),
-                    position_snapshot = COALESCE(NULLIF(position_snapshot, ''), (SELECT position FROM project_staff WHERE id = attendance.staff_id)),
-                    gender_snapshot = COALESCE(NULLIF(gender_snapshot, ''), (SELECT gender FROM project_staff WHERE id = attendance.staff_id))
-                WHERE staff_name_snapshot IS NULL OR staff_name_snapshot = ''
-                """)
 
                 # High-performance indexes
                 indexes = [
@@ -347,6 +341,23 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 current_v = row[0] if (row and row[0] is not None) else 0
                 if current_v < self.CURRENT_SCHEMA_VERSION:
+                    if current_v < 8:
+                        # Version-controlled one-time migration for historical snapshot backfill
+                        cursor.execute("""
+                        UPDATE attendance
+                        SET 
+                            staff_name_snapshot = COALESCE(NULLIF(staff_name_snapshot, ''), (SELECT name FROM project_staff WHERE id = attendance.staff_id)),
+                            unit_snapshot = COALESCE(NULLIF(unit_snapshot, ''), (SELECT unit FROM project_staff WHERE id = attendance.staff_id)),
+                            section_snapshot = COALESCE(NULLIF(section_snapshot, ''), (SELECT section FROM project_staff WHERE id = attendance.staff_id)),
+                            position_snapshot = COALESCE(NULLIF(position_snapshot, ''), (SELECT position FROM project_staff WHERE id = attendance.staff_id)),
+                            gender_snapshot = COALESCE(NULLIF(gender_snapshot, ''), (SELECT gender FROM project_staff WHERE id = attendance.staff_id)),
+                            phone_snapshot = COALESCE(NULLIF(phone_snapshot, ''), (SELECT phone FROM project_staff WHERE id = attendance.staff_id)),
+                            card_title_snapshot = COALESCE(NULLIF(card_title_snapshot, ''), (SELECT card_title FROM project_staff WHERE id = attendance.staff_id)),
+                            shift_time_snapshot = COALESCE(NULLIF(shift_time_snapshot, ''), (SELECT shift_time FROM project_staff WHERE id = attendance.staff_id)),
+                            is_multi_section_snapshot = COALESCE(NULLIF(is_multi_section_snapshot, ''), (SELECT is_multi_section FROM project_staff WHERE id = attendance.staff_id)),
+                            staff_code_snapshot = COALESCE(NULLIF(staff_code_snapshot, ''), (SELECT staff_code FROM project_staff WHERE id = attendance.staff_id))
+                        WHERE staff_name_snapshot IS NULL OR staff_name_snapshot = ''
+                        """)
                     cursor.execute("""
                     INSERT OR REPLACE INTO schema_meta (version, updated_at)
                     VALUES (?, ?)
@@ -422,6 +433,11 @@ class DatabaseManager:
             ("attendance", "section_snapshot", "TEXT"),
             ("attendance", "position_snapshot", "TEXT"),
             ("attendance", "gender_snapshot", "TEXT"),
+            ("attendance", "phone_snapshot", "TEXT"),
+            ("attendance", "card_title_snapshot", "TEXT"),
+            ("attendance", "shift_time_snapshot", "TEXT"),
+            ("attendance", "is_multi_section_snapshot", "TEXT"),
+            ("attendance", "staff_code_snapshot", "TEXT"),
             ("org_chart", "display_order", "INTEGER DEFAULT 0")
         ]
 

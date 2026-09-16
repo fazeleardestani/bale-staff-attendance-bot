@@ -74,15 +74,21 @@ class ProjectManager:
                         del wb[sname]
                 wb.save(target_file)
                 wb.close()
-            except Exception:
-                pass
+            except Exception as ex_err:
+                logging.error(f"Failed to prepare project template Excel: {ex_err}")
+                self.delete_project(project_id)
+                raise RuntimeError(f"خطا در آماده‌سازی قالب اکسل پروژه: {ex_err}")
 
             self.update_project_excel_path(project_id, target_file)
             try:
                 from excel_manager import excel_manager
-                excel_manager.import_project_excel(project_id, target_file)
-            except Exception:
-                pass
+                success = excel_manager.import_project_excel(project_id, target_file)
+                if not success:
+                    raise RuntimeError("اعتبارسنجی قالب اکسل پروژه با شکست مواجه شد.")
+            except Exception as imp_err:
+                logging.error(f"Initial project Excel import failed: {imp_err}")
+                self.delete_project(project_id)
+                raise RuntimeError(f"خطا در بارگذاری اولیه اکسل پروژه: {imp_err}")
 
         return project_id
 
@@ -99,6 +105,20 @@ class ProjectManager:
 
         first_session_id = None
 
+        from datetime import datetime, timedelta
+
+        num_sessions = int(total_sessions) if total_sessions and int(total_sessions) > 0 else 1
+
+        # Determine base starting date
+        base_dt = None
+        if start_date:
+            try:
+                base_dt = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+            except ValueError:
+                base_dt = datetime.now()
+        else:
+            base_dt = datetime.now()
+
         if project_type == 'کلاس':
             schedule_name = f"کلاس {name}"
             sched_id = attendance_manager.create_schedule(
@@ -106,10 +126,12 @@ class ProjectManager:
                 time_str=activation_time or "16:00"
             )
             
-            num_sessions = int(total_sessions) if total_sessions and int(total_sessions) > 0 else 1
             for i in range(1, num_sessions + 1):
+                sess_dt = base_dt + timedelta(days=7 * (i - 1))
+                sess_date_str = sess_dt.strftime("%Y-%m-%d")
                 sess_id = attendance_manager.create_session(
-                    project_id, name=f"جلسه {i}", time_str=activation_time, day_of_week=recurring_days,
+                    project_id, name=f"جلسه {i}", session_date=sess_date_str,
+                    time_str=activation_time, day_of_week=recurring_days,
                     schedule_id=sched_id, copy_from_prev_session=True, sync_excel_sheet=True
                 )
                 if i == 1:
@@ -117,15 +139,18 @@ class ProjectManager:
 
         else:
             if has_prep_day:
+                prep_dt = base_dt - timedelta(days=1)
                 prep_id = attendance_manager.create_session(
-                    project_id, name="روز آماده سازی", copy_from_prev_session=True, sync_excel_sheet=True
+                    project_id, name="روز آماده سازی", session_date=prep_dt.strftime("%Y-%m-%d"),
+                    copy_from_prev_session=True, sync_excel_sheet=True
                 )
                 first_session_id = prep_id
 
-            num_days = int(total_sessions) if total_sessions and int(total_sessions) > 0 else 1
-            for i in range(1, num_days + 1):
+            for i in range(1, num_sessions + 1):
+                day_dt = base_dt + timedelta(days=(i - 1))
                 sess_id = attendance_manager.create_session(
-                    project_id, name=f"روز {i}", copy_from_prev_session=True, sync_excel_sheet=True
+                    project_id, name=f"روز {i}", session_date=day_dt.strftime("%Y-%m-%d"),
+                    copy_from_prev_session=True, sync_excel_sheet=True
                 )
                 if first_session_id is None:
                     first_session_id = sess_id
@@ -221,6 +246,14 @@ class ProjectManager:
         conn.close()
 
     def delete_project(self, project_id):
+        # Mandatory safety backup before permanent deletion
+        try:
+            self.db.backup_database(label=f"pre_delete_project_{project_id}")
+            from excel_manager import excel_manager
+            excel_manager.backup_project_excel(project_id, label="pre_delete")
+        except Exception as b_err:
+            logging.warning(f"Pre-delete backup warning: {b_err}")
+
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         try:

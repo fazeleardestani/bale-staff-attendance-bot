@@ -62,15 +62,19 @@ class ExcelManager:
             target_path = os.path.join(category_dir, backup_name)
             shutil.copy2(excel_path, target_path)
 
-            # Retention policy: keep last 15 backups with explicit logging
+            # Retention policy: keep last 15 backups strictly per-project with explicit logging
             try:
+                prefix = f"project_{project_id}_backup_"
                 files = sorted(
-                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".xlsx")],
+                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.startswith(prefix) and f.endswith(".xlsx")],
                     key=os.path.getmtime
                 )
                 if len(files) > 15:
                     for old_f in files[:-15]:
-                        os.remove(old_f)
+                        try:
+                            os.remove(old_f)
+                        except OSError:
+                            pass
             except Exception as ret_err:
                 logging.warning(f"Excel backup retention cleanup notice: {ret_err}")
 
@@ -222,8 +226,31 @@ class ExcelManager:
                         if row:
                             sched_id = row['id']
 
-                    # 3. Check existing session
-                    session = attendance_manager.get_session_by_name(project_id, clean_sheet_name, schedule_id=sched_id)
+                    # 3. Exact match on existing session attached to an active schedule
+                    session = None
+                    if sched_id is None:
+                        cursor.execute("""
+                        SELECT s.id, s.schedule_id 
+                        FROM sessions s
+                        JOIN schedules sc ON s.schedule_id = sc.id
+                        WHERE s.project_id = ? AND s.name = ? AND s.status != 'CANCELLED' AND sc.is_active = 1
+                        """, (project_id, clean_sheet_name))
+                        s_row = cursor.fetchone()
+                        if s_row:
+                            sched_id = s_row['schedule_id']
+                            session_id = s_row['id']
+                            session = {'id': session_id, 'schedule_id': sched_id}
+
+                    # STRICT CLASS PROJECT ENFORCEMENT:
+                    # In a class project, every sheet MUST map to an active schedule. Never create a session without schedule!
+                    cursor.execute("SELECT type FROM projects WHERE id = ?", (project_id,))
+                    p_type_row = cursor.fetchone()
+                    if p_type_row and p_type_row['type'] == 'کلاس' and sched_id is None:
+                        raise ValueError(f"شیت «{sheet_name}» به هیچ برنامه (Schedule) فعال این پروژه متصل نیست.")
+
+                    # 4. Resolve or create session
+                    if not session:
+                        session = attendance_manager.get_session_by_name(project_id, clean_sheet_name, schedule_id=sched_id)
                     if not session:
                         session_id = attendance_manager.create_session(
                             project_id, clean_sheet_name, schedule_id=sched_id, 
@@ -318,9 +345,10 @@ class ExcelManager:
                         INSERT INTO attendance (
                             project_id, session_id, staff_id, status, card_status, late_tracking, description,
                             staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                            phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
                             updated_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
                             status = excluded.status,
                             card_status = excluded.card_status,
@@ -331,10 +359,16 @@ class ExcelManager:
                             section_snapshot = excluded.section_snapshot,
                             position_snapshot = excluded.position_snapshot,
                             gender_snapshot = excluded.gender_snapshot,
+                            phone_snapshot = excluded.phone_snapshot,
+                            card_title_snapshot = excluded.card_title_snapshot,
+                            shift_time_snapshot = excluded.shift_time_snapshot,
+                            is_multi_section_snapshot = excluded.is_multi_section_snapshot,
+                            staff_code_snapshot = excluded.staff_code_snapshot,
                             updated_at = excluded.updated_at
                         """, (
                             project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
                             name, unit, section, pos, gender,
+                            phone, card_title, shift_time, is_multi, staff_code,
                             now_iso
                         ))
 

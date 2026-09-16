@@ -85,7 +85,7 @@ class AttendanceManager:
                 raise ValueError(f"برنامه با شناسه {schedule_id} متعلق به این پروژه نیست یا فعال نمی‌باشد.")
 
         now_iso = datetime.now().isoformat()
-        date_str = session_date or datetime.now().strftime("%Y-%m-%d")
+        date_str = str(session_date or '').strip()
 
         # Check existing session by unique schedule + date constraint
         if schedule_id is not None and date_str:
@@ -113,7 +113,8 @@ class AttendanceManager:
                 # If schedule_id is provided, use ONLY schedule_staff. Zero fallback to project_staff!
                 if schedule_id is not None:
                     cursor.execute("""
-                    SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender
+                    SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender,
+                           ps.phone, ps.card_title, ps.shift_time, ps.is_multi_section, ps.staff_code
                     FROM schedule_staff ss
                     JOIN project_staff ps ON ss.staff_id = ps.id
                     WHERE ss.schedule_id = ? AND ss.is_active = 1 AND ps.is_active = 1
@@ -127,7 +128,8 @@ class AttendanceManager:
                 else:
                     # General project without schedule: use project_staff
                     cursor.execute("""
-                    SELECT id, name, unit, section, position, gender 
+                    SELECT id, name, unit, section, position, gender,
+                           phone, card_title, shift_time, is_multi_section, staff_code
                     FROM project_staff 
                     WHERE project_id = ? AND is_active = 1
                       AND (start_session_id IS NULL OR start_session_id <= ?)
@@ -136,19 +138,21 @@ class AttendanceManager:
                     """, (project_id, session_id, session_id))
                     eligible_staff = cursor.fetchall()
 
-                # Snapshot initial roster into attendance table
+                # Snapshot initial roster into attendance table with all historical fields
                 for s in eligible_staff:
                     cursor.execute("""
                     INSERT INTO attendance (
                         project_id, session_id, staff_id, status, card_status,
                         staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                        phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
                         updated_at
                     )
-                    VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
                     """, (
                         project_id, session_id, s['id'],
                         s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                        s['phone'], s['card_title'], s['shift_time'], s['is_multi_section'], s['staff_code'],
                         now_iso
                     ))
         except Exception as e:
@@ -320,17 +324,19 @@ class AttendanceManager:
 
         cursor.execute("""
         SELECT 
-            s.id as staff_id, s.project_id, 
+            a.staff_id, 
+            a.project_id, 
+            a.session_id,
             a.staff_name_snapshot,
-            s.phone, 
             a.unit_snapshot,
             a.section_snapshot,
             a.position_snapshot,
-            s.card_title, s.shift_time, 
             a.gender_snapshot,
-            s.notes as staff_notes,
-            s.is_multi_section, s._excel_row, s.staff_code,
-            s.start_session_id, s.end_session_id,
+            a.phone_snapshot,
+            a.card_title_snapshot,
+            a.shift_time_snapshot,
+            a.is_multi_section_snapshot,
+            a.staff_code_snapshot,
             COALESCE(a.id, 0) as attendance_id,
             COALESCE(a.status, '') as status,
             COALESCE(a.card_status, '') as card_status,
@@ -338,9 +344,8 @@ class AttendanceManager:
             COALESCE(a.description, '') as description,
             a.updated_at
         FROM attendance a
-        JOIN project_staff s ON a.staff_id = s.id
         WHERE a.project_id = ? AND a.session_id = ?
-        ORDER BY s.id ASC
+        ORDER BY a.staff_id ASC
         """, (project_id, session_id))
         rows = cursor.fetchall()
         conn.close()
@@ -358,6 +363,16 @@ class AttendanceManager:
             d['section'] = d.get('section_snapshot') or '-'
             d['position'] = d.get('position_snapshot') or 'نیرو'
             d['gender'] = d.get('gender_snapshot') or ''
+            d['phone'] = d.get('phone_snapshot') or ''
+            d['card_title'] = d.get('card_title_snapshot') or d['section']
+            d['shift_time'] = d.get('shift_time_snapshot') or ''
+            d['is_multi_section'] = d.get('is_multi_section_snapshot') or 'خیر'
+            d['staff_code'] = d.get('staff_code_snapshot') or ''
+            d['notes'] = ''
+            d['staff_notes'] = ''
+            d['_excel_row'] = None
+            d['start_session_id'] = None
+            d['end_session_id'] = None
             result.append(d)
 
         return result
@@ -386,7 +401,8 @@ class AttendanceManager:
 
         if schedule_id is not None:
             cursor.execute("""
-            SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender
+            SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender,
+                   ps.phone, ps.card_title, ps.shift_time, ps.is_multi_section, ps.staff_code
             FROM schedule_staff ss
             JOIN project_staff ps ON ss.staff_id = ps.id
             WHERE ss.schedule_id = ? AND ss.is_active = 1 AND ps.is_active = 1
@@ -399,7 +415,8 @@ class AttendanceManager:
             eligible_staff = cursor.fetchall()
         else:
             cursor.execute("""
-            SELECT id, name, unit, section, position, gender 
+            SELECT id, name, unit, section, position, gender,
+                   phone, card_title, shift_time, is_multi_section, staff_code
             FROM project_staff 
             WHERE project_id = ? AND is_active = 1
               AND (start_session_id IS NULL OR start_session_id <= ?)
@@ -415,13 +432,15 @@ class AttendanceManager:
                 INSERT INTO attendance (
                     project_id, session_id, staff_id, status, card_status,
                     staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
                     updated_at
                 )
-                VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
                 """, (
                     project_id, session_id, s['id'],
                     s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                    s['phone'], s['card_title'], s['shift_time'], s['is_multi_section'], s['staff_code'],
                     now_iso
                 ))
                 added_cnt += cursor.rowcount
@@ -429,28 +448,74 @@ class AttendanceManager:
         conn.close()
         return True, f"{added_cnt} رکورد کادر با موفقیت افزوده شد"
 
+    def add_staff_to_session_roster(self, project_id, session_id, staff_ids):
+        """
+        Adds specific staff members to a session's attendance roster with complete immutable snapshots.
+        """
+        if not staff_ids:
+            return True, 0
+        if isinstance(staff_ids, int):
+            staff_ids = [staff_ids]
+
+        conn = self.db.get_sqlite_connection()
+        cursor = conn.cursor()
+        now_iso = datetime.now().isoformat()
+        placeholders = ','.join(['?'] * len(staff_ids))
+        cursor.execute(f"""
+        SELECT id, name, unit, section, position, gender,
+               phone, card_title, shift_time, is_multi_section, staff_code
+        FROM project_staff
+        WHERE project_id = ? AND id IN ({placeholders})
+        """, [project_id] + list(staff_ids))
+        staff_rows = cursor.fetchall()
+
+        added_cnt = 0
+        with conn:
+            for s in staff_rows:
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, status, card_status,
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
+                    updated_at
+                )
+                VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
+                """, (
+                    project_id, session_id, s['id'],
+                    s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                    s['phone'], s['card_title'], s['shift_time'], s['is_multi_section'], s['staff_code'],
+                    now_iso
+                ))
+                added_cnt += cursor.rowcount
+        conn.close()
+        return True, added_cnt
+
     def get_staff_session_attendance(self, project_id, session_id, staff_id):
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         cursor.execute("""
         SELECT 
-            s.id as staff_id, s.project_id, 
+            a.staff_id, 
+            a.project_id, 
+            a.session_id,
             a.staff_name_snapshot,
-            s.phone, 
             a.unit_snapshot,
             a.section_snapshot,
             a.position_snapshot,
-            s.card_title, s.shift_time, 
             a.gender_snapshot,
-            s.notes as staff_notes,
-            s.is_multi_section, s._excel_row, s.staff_code,
-            s.start_session_id, s.end_session_id,
+            a.phone_snapshot,
+            a.card_title_snapshot,
+            a.shift_time_snapshot,
+            a.is_multi_section_snapshot,
+            a.staff_code_snapshot,
+            COALESCE(a.id, 0) as attendance_id,
             COALESCE(a.status, '') as status,
             COALESCE(a.card_status, '') as card_status,
             COALESCE(a.late_tracking, '') as late_tracking,
-            COALESCE(a.description, '') as description
+            COALESCE(a.description, '') as description,
+            a.updated_at
         FROM attendance a
-        JOIN project_staff s ON a.staff_id = s.id
         WHERE a.project_id = ? AND a.session_id = ? AND a.staff_id = ?
         """, (project_id, session_id, staff_id))
         row = cursor.fetchone()
@@ -463,6 +528,16 @@ class AttendanceManager:
         d['section'] = d.get('section_snapshot') or '-'
         d['position'] = d.get('position_snapshot') or 'نیرو'
         d['gender'] = d.get('gender_snapshot') or ''
+        d['phone'] = d.get('phone_snapshot') or ''
+        d['card_title'] = d.get('card_title_snapshot') or d['section']
+        d['shift_time'] = d.get('shift_time_snapshot') or ''
+        d['is_multi_section'] = d.get('is_multi_section_snapshot') or 'خیر'
+        d['staff_code'] = d.get('staff_code_snapshot') or ''
+        d['notes'] = ''
+        d['staff_notes'] = ''
+        d['_excel_row'] = None
+        d['start_session_id'] = None
+        d['end_session_id'] = None
         return d
 
     def update_attendance_status(self, project_id, session_id, staff_id, status_val, actor_user_id=None, sync_same_phone=True):

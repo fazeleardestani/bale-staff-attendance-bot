@@ -13,62 +13,73 @@ class StaffManager:
                          card_title=None, shift_time='', gender='', notes='', 
                          is_multi_section='خیر', excel_row=None, staff_code=None,
                          start_session_id=None, end_session_id=None, schedule_id=None):
+        """
+        Atomically creates or updates staff member and assigns to schedule within a single transaction.
+        If schedule validation or assignment fails, entire operation rolls back.
+        """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         c_title = card_title if card_title is not None else section
         clean_code = str(staff_code).strip() if staff_code else None
 
-        # If schedule_id is provided, verify it belongs to this project
-        if schedule_id is not None:
-            cursor.execute("SELECT id FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (schedule_id, project_id))
-            if not cursor.fetchone():
-                conn.close()
-                raise ValueError(f"برنامه {schedule_id} متعلق به پروژه {project_id} نیست.")
+        try:
+            with conn:
+                # If schedule_id is provided, verify it belongs to this project
+                if schedule_id is not None:
+                    cursor.execute("SELECT id FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (schedule_id, project_id))
+                    if not cursor.fetchone():
+                        raise ValueError(f"برنامه {schedule_id} متعلق به پروژه {project_id} نیست.")
 
-        # If clean_code exists, check if staff already exists in this project
-        if clean_code:
-            cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, clean_code))
-            existing = cursor.fetchone()
-            if existing:
-                staff_id = existing['id']
-                cursor.execute("""
-                UPDATE project_staff SET
-                    name = ?, phone = COALESCE(NULLIF(?, ''), phone),
-                    unit = ?, section = ?, position = ?,
-                    card_title = ?, shift_time = COALESCE(NULLIF(?, ''), shift_time),
-                    gender = COALESCE(NULLIF(?, ''), gender),
-                    notes = COALESCE(NULLIF(?, ''), notes),
-                    is_active = 1
-                WHERE id = ?
-                """, (name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), position.strip(),
-                      str(c_title).strip(), str(shift_time or '').strip(), gender.strip(), notes.strip(), staff_id))
-                conn.commit()
-                conn.close()
-                if schedule_id:
-                    self.assign_staff_to_schedule(schedule_id, staff_id, start_session_id, end_session_id)
-                return staff_id
+                staff_id = None
+                # If clean_code exists, check if staff already exists in this project
+                if clean_code:
+                    cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, clean_code))
+                    existing = cursor.fetchone()
+                    if existing:
+                        staff_id = existing['id']
+                        cursor.execute("""
+                        UPDATE project_staff SET
+                            name = ?, phone = COALESCE(NULLIF(?, ''), phone),
+                            unit = ?, section = ?, position = ?,
+                            card_title = ?, shift_time = COALESCE(NULLIF(?, ''), shift_time),
+                            gender = COALESCE(NULLIF(?, ''), gender),
+                            notes = COALESCE(NULLIF(?, ''), notes),
+                            is_active = 1
+                        WHERE id = ?
+                        """, (name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), position.strip(),
+                              str(c_title).strip(), str(shift_time or '').strip(), gender.strip(), notes.strip(), staff_id))
 
-        cursor.execute("""
-        INSERT INTO project_staff 
-        (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, is_active, notes, is_multi_section, start_session_id, end_session_id, _excel_row)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-        """, (project_id, clean_code, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
-              position.strip(), str(c_title).strip(), str(shift_time or '').strip(), 
-              gender.strip(), notes.strip(), is_multi_section, start_session_id, end_session_id, excel_row))
-        staff_id = cursor.lastrowid
+                if not staff_id:
+                    cursor.execute("""
+                    INSERT INTO project_staff 
+                    (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, is_active, notes, is_multi_section, start_session_id, end_session_id, _excel_row)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                    """, (project_id, clean_code, name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), 
+                          position.strip(), str(c_title).strip(), str(shift_time or '').strip(), 
+                          gender.strip(), notes.strip(), is_multi_section, start_session_id, end_session_id, excel_row))
+                    staff_id = cursor.lastrowid
 
-        # If staff_code was not provided, auto-assign deterministic code STF-<id:05d>
-        if not clean_code:
-            auto_code = f"STF-{staff_id:05d}"
-            cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
+                    if not clean_code:
+                        auto_code = f"STF-{staff_id:05d}"
+                        cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
 
-        conn.commit()
-        conn.close()
+                if schedule_id is not None:
+                    now_iso = datetime.now().isoformat()
+                    cursor.execute("""
+                    INSERT INTO schedule_staff (schedule_id, staff_id, start_session_id, end_session_id, is_active, created_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(schedule_id, staff_id) DO UPDATE SET
+                        start_session_id = COALESCE(excluded.start_session_id, schedule_staff.start_session_id),
+                        end_session_id = excluded.end_session_id,
+                        is_active = 1
+                    """, (schedule_id, staff_id, start_session_id, end_session_id, now_iso))
 
-        if schedule_id:
-            self.assign_staff_to_schedule(schedule_id, staff_id, start_session_id, end_session_id)
-
-        return staff_id
+            return staff_id
+        except Exception as e:
+            logging.error(f"add_staff_member failed and rolled back: {e}")
+            raise
+        finally:
+            conn.close()
 
     def get_staff_member(self, staff_id):
         conn = self.db.get_sqlite_connection()

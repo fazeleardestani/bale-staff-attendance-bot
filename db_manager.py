@@ -299,6 +299,17 @@ class DatabaseManager:
 
                 # Execute explicit schema migrations
                 self._apply_migrations(cursor)
+                # Legacy snapshot backfill migration
+                cursor.execute("""
+                UPDATE attendance
+                SET 
+                    staff_name_snapshot = COALESCE(NULLIF(staff_name_snapshot, ''), (SELECT name FROM project_staff WHERE id = attendance.staff_id)),
+                    unit_snapshot = COALESCE(NULLIF(unit_snapshot, ''), (SELECT unit FROM project_staff WHERE id = attendance.staff_id)),
+                    section_snapshot = COALESCE(NULLIF(section_snapshot, ''), (SELECT section FROM project_staff WHERE id = attendance.staff_id)),
+                    position_snapshot = COALESCE(NULLIF(position_snapshot, ''), (SELECT position FROM project_staff WHERE id = attendance.staff_id)),
+                    gender_snapshot = COALESCE(NULLIF(gender_snapshot, ''), (SELECT gender FROM project_staff WHERE id = attendance.staff_id))
+                WHERE staff_name_snapshot IS NULL OR staff_name_snapshot = ''
+                """)
 
                 # High-performance indexes
                 indexes = [

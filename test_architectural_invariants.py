@@ -2,6 +2,9 @@ import sys
 import os
 import sqlite3
 import unittest
+import tempfile
+import shutil
+import openpyxl
 from datetime import datetime
 
 sys.path.insert(0, '/working_dir/c_482d3e8b87a19f32')
@@ -175,12 +178,27 @@ class TestArchitecturalInvariants(unittest.TestCase):
     def test_06_no_tmp_sqlite_fallback_on_unwritable_path(self):
         """
         P1 Requirement 6:
-        DatabaseManager must NOT silently fall back to /tmp. If path is invalid or locked,
-        it must raise DatabaseUnavailableError.
+        DatabaseManager must NOT silently fall back to /tmp.
+        When initialized on an unwritable path, it must fail fast with DatabaseUnavailableError
+        and verify that no secondary database file is created in /tmp.
         """
-        invalid_path = "/non_existent_folder_xyz_123/database.db"
-        with self.assertRaises(DatabaseUnavailableError):
-            DatabaseManager(db_path=invalid_path)
+        temp_parent = tempfile.mkdtemp()
+        os.chmod(temp_parent, 0o555)  # Read & Execute only, no Write permission
+        unwritable_db = os.path.join(temp_parent, "test_locked_dir", "test_fail.db")
+        expected_tmp_fallback = "/tmp/test_fail.db"
+
+        if os.path.exists(expected_tmp_fallback):
+            os.remove(expected_tmp_fallback)
+
+        try:
+            with self.assertRaises(DatabaseUnavailableError):
+                DatabaseManager(db_path=unwritable_db)
+
+            # CRITICAL ASSERTION: No database must EVER be created in /tmp as a hidden fallback!
+            self.assertFalse(os.path.exists(expected_tmp_fallback), "Hidden /tmp database fallback must NOT be created!")
+        finally:
+            os.chmod(temp_parent, 0o777)
+            shutil.rmtree(temp_parent)
 
     def test_07_create_session_atomicity(self):
         """
@@ -230,6 +248,79 @@ class TestArchitecturalInvariants(unittest.TestCase):
 
         if os.path.exists(test_restore_path):
             os.remove(test_restore_path)
+
+    def test_09_excel_import_schedule_roster_isolation(self):
+        """
+        P0 Requirement (New):
+        Excel Import MUST NOT bypass Schedule Roster Isolation.
+        If Schedule Monday has Ali, and Schedule Tuesday has Reza:
+        Importing an Excel sheet for Monday that contains BOTH Ali and Reza
+        MUST record attendance for Ali, and MUST REJECT/SKIP Reza for Monday session!
+        """
+        ts = str(datetime.now().timestamp())
+        pid = project_manager.create_project(f"پروژه تست اکسل اسکجول {ts}", project_type="کلاس")
+        sched_mon = attendance_manager.create_schedule(pid, "دوشنبه", "دوشنبه", "16:00")
+        sched_tue = attendance_manager.create_schedule(pid, "سه‌شنبه", "سه‌شنبه", "16:00")
+
+        # Ali is enrolled in Monday schedule
+        st_ali = staff_manager.add_staff_member(pid, "علی دوشنبه‌تبار", "09121110001", "آموزش", "پذیرش", gender="آقا", schedule_id=sched_mon)
+        # Reza is enrolled in Tuesday schedule
+        st_reza = staff_manager.add_staff_member(pid, "رضا سه‌شنبه‌تبار", "09121110002", "خدمات", "پذیرایی", gender="آقا", schedule_id=sched_tue)
+
+        # Create Monday session
+        sess_mon = attendance_manager.create_session(pid, "جلسه دوشنبه ۱", schedule_id=sched_mon)
+
+        # Create Excel file with sheet "جلسه دوشنبه ۱"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "جلسه دوشنبه ۱"
+        headers = ["ردیف", "واحد", "بخش", "نام و نام خانوادگی", "سمت", "عنوان کارت", "شماره تماس", "ساعت حضور", "پیگیری تاخیر", "توضیحات", "وضعیت کارت", "وضعیت حضور", "جنسیت", "فعال در چند بخش؟"]
+        ws.append(headers)
+
+        # Add Ali (legitimate Monday staff)
+        ws.append([1, "آموزش", "پذیرش", "علی دوشنبه‌تبار", "نیرو", "پذیرش", "09121110001", "16:00", "", "", "تحویل داده شد", "حاضر", "آقا", "خیر"])
+        # Add Reza (intruder, belongs to Tuesday schedule!)
+        ws.append([2, "خدمات", "پذیرایی", "رضا سه‌شنبه‌تبار", "نیرو", "پذیرایی", "09121110002", "16:00", "", "", "تحویل داده شد", "حاضر", "آقا", "خیر"])
+
+        excel_test_path = f"/tmp/test_excel_isolation_{ts}.xlsx"
+        wb.save(excel_test_path)
+        wb.close()
+
+        try:
+            # Import Excel
+            excel_manager.import_project_excel(pid, excel_test_path)
+
+            # Check Monday session attendance
+            rec_ali = attendance_manager.get_staff_session_attendance(pid, sess_mon, st_ali)
+            self.assertIsNotNone(rec_ali, "Ali is in Monday schedule and MUST have attendance!")
+            self.assertEqual(rec_ali['status'], "حاضر")
+
+            # CRITICAL ASSERTION: Reza MUST NOT have attendance in Monday session!
+            rec_reza = attendance_manager.get_staff_session_attendance(pid, sess_mon, st_reza)
+            self.assertIsNone(rec_reza, "CRITICAL: Reza belongs to Tuesday schedule and MUST NOT be imported into Monday session attendance!")
+        finally:
+            if os.path.exists(excel_test_path):
+                os.remove(excel_test_path)
+
+    def test_10_atomic_add_staff_member_with_schedule(self):
+        """
+        P1 Requirement (New):
+        add_staff_member with schedule_id must be atomic.
+        If schedule validation fails, no orphan staff member is created in project_staff.
+        """
+        ts = str(datetime.now().timestamp())
+        pid1 = project_manager.create_project(f"پروژه اتمیک یک {ts}")
+        pid2 = project_manager.create_project(f"پروژه اتمیک دو {ts}")
+
+        sched_other = attendance_manager.create_schedule(pid2, "برنامه پروژه ۲", "شنبه", "10:00")
+
+        # Attempt to add staff to Project 1 with schedule from Project 2 -> ValueError
+        with self.assertRaises(ValueError):
+            staff_manager.add_staff_member(pid1, "نیروی نامعتبر", "09128889900", "واحد", "بخش", schedule_id=sched_other)
+
+        # Verify no orphan staff was created in Project 1
+        st_list = staff_manager.list_staff(pid1)
+        self.assertEqual(len(st_list), 0, "No orphan staff must exist after rollback!")
 
 if __name__ == '__main__':
     unittest.main()

@@ -392,8 +392,8 @@ class PermissionManager:
                 if actor_gender and staff_gender and actor_gender != staff_gender:
                     return False, f"عدم تطابق جنسیتی: اپراتور {actor_gender} مجاز به تغییر وضعیت نیروی {staff_gender} نیست", role
 
-            # STRICT SESSION ROSTER ENROLLMENT (P0):
-            # Staff must actually be present in this session's attendance table!
+            # STRICT SESSION & SCHEDULE ROSTER ENROLLMENT (P0):
+            # Staff must be present in attendance AND if session has a schedule, in schedule_staff!
             if session_id is not None and action in ("update_attendance", "update_card", "add_late", "edit_desc", "view_staff_attendance"):
                 conn = self.db.get_sqlite_connection()
                 cursor = conn.cursor()
@@ -402,9 +402,21 @@ class PermissionManager:
                 WHERE project_id = ? AND session_id = ? AND staff_id = ?
                 """, (project_id, session_id, staff_id))
                 in_roster = cursor.fetchone()
+
+                cursor.execute("SELECT schedule_id FROM sessions WHERE id = ?", (session_id,))
+                s_row = cursor.fetchone()
+                sched_id = s_row['schedule_id'] if s_row else None
+                sched_ok = True
+                if sched_id is not None:
+                    cursor.execute("""
+                    SELECT 1 FROM schedule_staff 
+                    WHERE schedule_id = ? AND staff_id = ? AND is_active = 1
+                    """, (sched_id, staff_id))
+                    sched_ok = bool(cursor.fetchone())
+
                 conn.close()
-                if not in_roster:
-                    return False, "نیرو در لیست حضور و غیاب این جلسه عضو نیست و امکان ثبت وضعیت برای او وجود ندارد", role
+                if not in_roster or not sched_ok:
+                    return False, "نیرو در لیست کادر مجاز این جلسه/کلاس عضو نیست و امکان ثبت وضعیت برای او وجود ندارد", role
 
         return True, "دسترسی مجاز", role
 

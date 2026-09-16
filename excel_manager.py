@@ -115,11 +115,14 @@ class ExcelManager:
 
     def import_project_excel(self, project_id, uploaded_file_path):
         """
-        Transactional import of project Excel file.
+        Transactional, schedule-aware import of project Excel file.
         1. Validates extension (rejects .xls).
         2. Creates safety backups (database + excel).
-        3. Executes changes in a single SQLite transaction.
-        4. Rolls back completely on failure.
+        3. Enforces schedule roster invariant:
+           If a session belongs to a schedule, attendance is STRICTLY constrained to schedule_staff.
+           If schedule_staff is empty, the sheet initializes schedule_staff and future empty sessions sync from it.
+           If schedule_staff already has assigned members, staff outside the roster are NOT added to attendance.
+        4. Atomic transaction with full rollback on error.
         """
         if uploaded_file_path.lower().endswith('.xls') and not uploaded_file_path.lower().endswith('.xlsx'):
             raise ValueError("فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
@@ -144,129 +147,208 @@ class ExcelManager:
         now_iso = datetime.now().isoformat()
 
         try:
-            # 1. Organizational Chart with display order
-            if "چارت" in wb.sheetnames:
-                ws_chart = wb["چارت"]
-                pairs = []
-                for r in range(2, ws_chart.max_row + 1):
-                    u = str(ws_chart.cell(row=r, column=1).value or "").strip()
-                    s = str(ws_chart.cell(row=r, column=2).value or "").strip()
-                    if u and u not in ("None", ""):
-                        pairs.append((u, s, r - 1))
-                project_manager.set_project_org_chart(project_id, pairs)
+            with conn:
+                # 1. Organizational Chart with display order
+                if "چارت" in wb.sheetnames:
+                    ws_chart = wb["چارت"]
+                    pairs = []
+                    for r in range(2, ws_chart.max_row + 1):
+                        u = str(ws_chart.cell(row=r, column=1).value or "").strip()
+                        s = str(ws_chart.cell(row=r, column=2).value or "").strip()
+                        if u and u not in ("None", ""):
+                            pairs.append((u, s, r - 1))
+                    project_manager.set_project_org_chart(project_id, pairs)
 
-            # 2. Shortages
-            if "تامین نیرو" in wb.sheetnames:
-                ws_sh = wb["تامین نیرو"]
-                cursor.execute("DELETE FROM shortages WHERE project_id = ?", (project_id,))
-                for r in range(2, ws_sh.max_row + 1):
-                    u = str(ws_sh.cell(row=r, column=2).value or "").strip()
-                    s = str(ws_sh.cell(row=r, column=3).value or "").strip()
-                    st = str(ws_sh.cell(row=r, column=4).value or "").strip()
-                    assigned_name = str(ws_sh.cell(row=r, column=5).value or "").strip()
-                    phone = str(ws_sh.cell(row=r, column=6).value or "").strip()
-                    desc = str(ws_sh.cell(row=r, column=7).value or "").strip()
-                    target_grp = str(ws_sh.cell(row=r, column=8).value or "").strip()
-                    if u and u not in ("None", ""):
+                # 2. Shortages
+                if "تامین نیرو" in wb.sheetnames:
+                    ws_sh = wb["تامین نیرو"]
+                    cursor.execute("DELETE FROM shortages WHERE project_id = ?", (project_id,))
+                    for r in range(2, ws_sh.max_row + 1):
+                        u = str(ws_sh.cell(row=r, column=2).value or "").strip()
+                        s = str(ws_sh.cell(row=r, column=3).value or "").strip()
+                        st = str(ws_sh.cell(row=r, column=4).value or "").strip()
+                        assigned_name = str(ws_sh.cell(row=r, column=5).value or "").strip()
+                        phone = str(ws_sh.cell(row=r, column=6).value or "").strip()
+                        desc = str(ws_sh.cell(row=r, column=7).value or "").strip()
+                        target_grp = str(ws_sh.cell(row=r, column=8).value or "").strip()
+                        if u and u not in ("None", ""):
+                            cursor.execute("""
+                            INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
+                            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
+                            """, (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
+
+                # 3. Sessions & Staff (Schedule-Aware)
+                for sheet_name in valid_sheets:
+                    session = attendance_manager.get_session_by_name(project_id, sheet_name)
+                    if not session:
+                        # Match schedule by name or substring if exists
                         cursor.execute("""
-                        INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
-                        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
-                        """, (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
-
-            # 3. Sessions & Staff
-            for sheet_name in valid_sheets:
-                session = attendance_manager.get_session_by_name(project_id, sheet_name)
-                if not session:
-                    session_id = attendance_manager.create_session(project_id, sheet_name, copy_from_prev_session=False, sync_excel_sheet=False)
-                else:
-                    session_id = session['id']
-
-                ws = wb[sheet_name]
-                header_map = {}
-                for c in range(1, 100):
-                    val = ws.cell(row=1, column=c).value
-                    if val:
-                        header_map[str(val).strip()] = c
-
-                for r_idx in range(2, ws.max_row + 1):
-                    def get_val(col_name):
-                        c = header_map.get(col_name)
-                        if not c: return ""
-                        v = ws.cell(row=r_idx, column=c).value
-                        return str(v or "").strip() if v is not None and str(v).strip() != "None" else ""
-
-                    name = get_val("نام و نام خانوادگی")
-                    if not name: continue
-                    staff_code = get_val("کد پرسنلی") or get_val("کد نیرو") or get_val("شناسه نیرو")
-                    unit = get_val("واحد")
-                    section = get_val("بخش")
-                    pos = get_val("سمت") or "نیرو"
-                    card_title = get_val("عنوان کارت") or section
-                    phone = get_val("شماره تماس")
-                    shift_time = get_val("ساعت حضور")
-                    late_trk = get_val("پیگیری تاخیر")
-                    desc = get_val("توضیحات")
-                    card_st = get_val("وضعیت کارت")
-                    att_st = get_val("وضعیت حضور")
-                    gender = get_val("جنسیت")
-                    is_multi = get_val("فعال در چند بخش؟") or "خیر"
-
-                    # Stable identity: check staff_code first if available
-                    staff_row = None
-                    if staff_code:
-                        cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, staff_code))
-                        staff_row = cursor.fetchone()
-
-                    if not staff_row:
-                        cursor.execute("""
-                        SELECT id FROM project_staff WHERE project_id = ? AND name = ? AND unit = ? AND section = ?
-                        """, (project_id, name, unit, section))
-                        staff_row = cursor.fetchone()
-
-                    if staff_row:
-                        staff_id = staff_row['id']
-                        cursor.execute("""
-                        UPDATE project_staff SET
-                            phone = COALESCE(NULLIF(?, ''), phone),
-                            shift_time = COALESCE(NULLIF(?, ''), shift_time),
-                            gender = COALESCE(NULLIF(?, ''), gender),
-                            position = COALESCE(NULLIF(?, ''), position),
-                            card_title = COALESCE(NULLIF(?, ''), card_title),
-                            _excel_row = ?
-                        WHERE id = ?
-                        """, (phone, shift_time, gender, pos, card_title, r_idx, staff_id))
+                        SELECT id FROM schedules 
+                        WHERE project_id = ? AND (name = ? OR ? LIKE '%' || name || '%' OR name LIKE '%' || ? || '%') AND is_active = 1
+                        """, (project_id, sheet_name, sheet_name, sheet_name))
+                        matched_sched = cursor.fetchone()
+                        sched_id = matched_sched['id'] if matched_sched else None
+                        
+                        session_id = attendance_manager.create_session(
+                            project_id, sheet_name, schedule_id=sched_id, 
+                            copy_from_prev_session=False, sync_excel_sheet=False
+                        )
                     else:
+                        session_id = session['id']
+                        sched_id = session.get('schedule_id')
+
+                    # Check existing roster in schedule_staff for this schedule
+                    existing_schedule_staff_ids = set()
+                    is_initial_schedule_setup = False
+                    if sched_id is not None:
+                        cursor.execute("SELECT staff_id FROM schedule_staff WHERE schedule_id = ? AND is_active = 1", (sched_id,))
+                        existing_schedule_staff_ids = {r['staff_id'] for r in cursor.fetchall()}
+                        if len(existing_schedule_staff_ids) == 0:
+                            is_initial_schedule_setup = True
+
+                    ws = wb[sheet_name]
+                    header_map = {}
+                    for c in range(1, 100):
+                        val = ws.cell(row=1, column=c).value
+                        if val:
+                            header_map[str(val).strip()] = c
+
+                    enrolled_in_sheet = []
+
+                    for r_idx in range(2, ws.max_row + 1):
+                        def get_val(col_name):
+                            c = header_map.get(col_name)
+                            if not c: return ""
+                            v = ws.cell(row=r_idx, column=c).value
+                            return str(v or "").strip() if v is not None and str(v).strip() != "None" else ""
+
+                        name = get_val("نام و نام خانوادگی")
+                        if not name: continue
+                        staff_code = get_val("کد پرسنلی") or get_val("کد نیرو") or get_val("شناسه نیرو")
+                        unit = get_val("واحد")
+                        section = get_val("بخش")
+                        pos = get_val("سمت") or "نیرو"
+                        card_title = get_val("عنوان کارت") or section
+                        phone = get_val("شماره تماس")
+                        shift_time = get_val("ساعت حضور")
+                        late_trk = get_val("پیگیری تاخیر")
+                        desc = get_val("توضیحات")
+                        card_st = get_val("وضعیت کارت")
+                        att_st = get_val("وضعیت حضور")
+                        gender = get_val("جنسیت")
+                        is_multi = get_val("فعال در چند بخش؟") or "خیر"
+
+                        # Stable identity: check staff_code first if available
+                        staff_row = None
+                        if staff_code:
+                            cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, staff_code))
+                            staff_row = cursor.fetchone()
+
+                        if not staff_row:
+                            cursor.execute("""
+                            SELECT id FROM project_staff WHERE project_id = ? AND name = ? AND unit = ? AND section = ?
+                            """, (project_id, name, unit, section))
+                            staff_row = cursor.fetchone()
+
+                        if staff_row:
+                            staff_id = staff_row['id']
+                            cursor.execute("""
+                            UPDATE project_staff SET
+                                phone = COALESCE(NULLIF(?, ''), phone),
+                                shift_time = COALESCE(NULLIF(?, ''), shift_time),
+                                gender = COALESCE(NULLIF(?, ''), gender),
+                                position = COALESCE(NULLIF(?, ''), position),
+                                card_title = COALESCE(NULLIF(?, ''), card_title),
+                                _excel_row = ?
+                            WHERE id = ?
+                            """, (phone, shift_time, gender, pos, card_title, r_idx, staff_id))
+                        else:
+                            cursor.execute("""
+                            INSERT INTO project_staff (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, notes, is_multi_section, _excel_row)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (project_id, staff_code, name, phone, unit, section, pos, card_title, shift_time, gender, desc, is_multi, r_idx))
+                            staff_id = cursor.lastrowid
+                            if not staff_code:
+                                auto_code = f"STF-{staff_id:05d}"
+                                cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
+
+                        # ROSTER INVARIANT VERIFICATION:
+                        can_record_attendance = True
+                        if sched_id is not None:
+                            if is_initial_schedule_setup:
+                                # Initial setup of this schedule via Excel sheet
+                                cursor.execute("""
+                                INSERT INTO schedule_staff (schedule_id, staff_id, is_active, created_at)
+                                VALUES (?, ?, 1, ?)
+                                ON CONFLICT(schedule_id, staff_id) DO UPDATE SET is_active = 1
+                                """, (sched_id, staff_id, now_iso))
+                                existing_schedule_staff_ids.add(staff_id)
+                                can_record_attendance = True
+                            else:
+                                # Schedule ALREADY has an established roster:
+                                # Staff must be an enrolled active member of this schedule!
+                                if staff_id in existing_schedule_staff_ids:
+                                    can_record_attendance = True
+                                else:
+                                    can_record_attendance = False
+                                    logging.warning(f"Excel import: Staff '{name}' (ID {staff_id}) is not in schedule {sched_id} roster. Skipping attendance for session {session_id}.")
+
+                        if can_record_attendance:
+                            enrolled_in_sheet.append({
+                                'id': staff_id, 'name': name, 'unit': unit, 
+                                'section': section, 'position': pos, 'gender': gender
+                            })
+                            cursor.execute("""
+                            INSERT INTO attendance (
+                                project_id, session_id, staff_id, status, card_status, late_tracking, description,
+                                staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
+                                status = excluded.status,
+                                card_status = excluded.card_status,
+                                late_tracking = excluded.late_tracking,
+                                description = excluded.description,
+                                staff_name_snapshot = excluded.staff_name_snapshot,
+                                unit_snapshot = excluded.unit_snapshot,
+                                section_snapshot = excluded.section_snapshot,
+                                position_snapshot = excluded.position_snapshot,
+                                gender_snapshot = excluded.gender_snapshot,
+                                updated_at = excluded.updated_at
+                            """, (
+                                project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
+                                name, unit, section, pos, gender,
+                                now_iso
+                            ))
+
+                    # Auto-sync future empty sessions of the same schedule if this schedule was initialized
+                    if sched_id is not None and is_initial_schedule_setup and enrolled_in_sheet:
                         cursor.execute("""
-                        INSERT INTO project_staff (project_id, staff_code, name, phone, unit, section, position, card_title, shift_time, gender, notes, is_multi_section, _excel_row)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (project_id, staff_code, name, phone, unit, section, pos, card_title, shift_time, gender, desc, is_multi, r_idx))
-                        staff_id = cursor.lastrowid
-                        if not staff_code:
-                            auto_code = f"STF-{staff_id:05d}"
-                            cursor.execute("UPDATE project_staff SET staff_code = ? WHERE id = ?", (auto_code, staff_id))
+                        SELECT id FROM sessions 
+                        WHERE project_id = ? AND schedule_id = ? AND id != ? AND status != 'CANCELLED'
+                        """, (project_id, sched_id, session_id))
+                        other_sessions = cursor.fetchall()
+                        for osess in other_sessions:
+                            osid = osess['id']
+                            cursor.execute("SELECT COUNT(*) FROM attendance WHERE project_id = ? AND session_id = ?", (project_id, osid))
+                            if cursor.fetchone()[0] == 0:
+                                for s_item in enrolled_in_sheet:
+                                    cursor.execute("""
+                                    INSERT INTO attendance (
+                                        project_id, session_id, staff_id, status, card_status,
+                                        staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                                        updated_at
+                                    )
+                                    VALUES (?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT(project_id, session_id, staff_id) DO NOTHING
+                                    """, (
+                                        project_id, osid, s_item['id'],
+                                        s_item['name'], s_item['unit'], s_item['section'], s_item['position'], s_item['gender'],
+                                        now_iso
+                                    ))
 
-                    cursor.execute("""
-                    INSERT INTO attendance (
-                        project_id, session_id, staff_id, status, card_status, late_tracking, description,
-                        staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                        status = excluded.status,
-                        card_status = excluded.card_status,
-                        late_tracking = excluded.late_tracking,
-                        description = excluded.description,
-                        updated_at = excluded.updated_at
-                    """, (
-                        project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
-                        name, unit, section, pos, gender,
-                        now_iso
-                    ))
-
-            conn.commit()
         except Exception as err:
-            conn.rollback()
             logging.error(f"Excel import failed and was rolled back: {err}")
             raise err
         finally:

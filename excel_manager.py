@@ -5,6 +5,7 @@ import importlib.util
 import logging
 import tempfile
 import shutil
+import re
 import openpyxl
 from copy import copy
 from datetime import datetime
@@ -118,41 +119,50 @@ class ExcelManager:
         """
         Two-Phase Commit, schedule-lifecycle-aware import of project Excel file.
         1. Validates extension (rejects .xls).
-        2. Copies uploaded Excel to staging path and validates structure upfront.
-        3. Creates safety backups (DB + Excel).
-        4. Applies all DB updates (Org chart, Shortages, Schedule Staff, Attendance Snapshots) in a single DB transaction.
+        2. Copies uploaded Excel to secure staging path using NamedTemporaryFile.
+        3. Validates structure upfront (workbook readable, non-empty).
+        4. Creates safety pre-update backups (DB + Excel).
+        5. Applies all DB updates (Org chart, Shortages, Schedule Staff, Attendance Snapshots) in a single DB transaction:
+           - Matches Schedule strictly by Exact Name or Explicit ID tag (NO fuzzy substring matching).
            - New staff in sheet -> added to schedule_staff.
            - Existing staff in sheet -> reactivated/maintained.
-           - Omitted staff from sheet -> deactivated in schedule_staff (membership lifecycle without deleting project_staff).
-        5. Atomically replaces target Excel on disk ONLY AFTER DB transaction commits.
-        6. Full automated recovery if physical file replacement fails.
+           - Omitted staff from sheet -> deactivated ONLY in that specific schedule (without deleting project_staff or touching other schedules).
+        6. Atomically replaces target Excel on disk ONLY AFTER DB transaction commits.
+        7. Verifies replaced Excel file. If replacement/verification fails, performs two-phase recovery.
         """
         if uploaded_file_path.lower().endswith('.xls') and not uploaded_file_path.lower().endswith('.xlsx'):
             raise ValueError("فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
 
         from attendance_manager import attendance_manager
 
-        # Phase 1: Staging & Validation
-        temp_staging = tempfile.mktemp(suffix=".xlsx")
-        try:
-            shutil.copy2(uploaded_file_path, temp_staging)
-        except Exception as e:
-            raise ValueError(f"امکان خواندن فایل آپلود شده وجود ندارد: {e}")
+        # Phase 1: Secure Staging & Validation
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as staging_file:
+            staging_path = staging_file.name
 
         try:
-            wb = openpyxl.load_workbook(temp_staging, data_only=True)
+            shutil.copy2(uploaded_file_path, staging_path)
+            wb = openpyxl.load_workbook(staging_path, data_only=True)
+            if len(wb.sheetnames) == 0:
+                raise ValueError("فایل اکسل ارسالی فاقد هرگونه برگه (Sheet) می‌باشد.")
         except Exception as e:
-            if os.path.exists(temp_staging):
-                os.remove(temp_staging)
-            raise ValueError(f"فایل ارسالی یک فایل معتبر اکسل نمی‌باشد: {e}")
+            if os.path.exists(staging_path):
+                os.remove(staging_path)
+            raise ValueError(f"فایل اکسل نامعتبر یا غیرقابل خواندن است: {e}")
 
         exclude_sheets = ['تامین نیرو', 'چارت', 'داشبورد']
         valid_sheets = [s for s in wb.sheetnames if s not in exclude_sheets]
 
         # Phase 2: Create Pre-Update Backups
         db_backup_path = db_instance.backup_database(label="pre_update")
-        excel_backup_path = self.backup_project_excel(project_id, label="pre_update")
+        if not db_backup_path or not db_instance.verify_backup_integrity(db_backup_path):
+            if os.path.exists(staging_path):
+                os.remove(staging_path)
+            raise RuntimeError("امکان ایجاد نسخه پشتیبان معتبر از پایگاه داده قبل از شروع عملیات وجود ندارد.")
+
         proj_excel_path = self.get_project_excel_path(project_id)
+        excel_backup_path = None
+        if os.path.exists(proj_excel_path):
+            excel_backup_path = self.backup_project_excel(project_id, label="pre_update")
 
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
@@ -192,23 +202,36 @@ class ExcelManager:
 
                 # 3. Sheets -> Schedule Staff Lifecycle & Session Attendance
                 for sheet_name in valid_sheets:
-                    # Match schedule if sheet corresponds to schedule name
-                    cursor.execute("""
-                    SELECT id FROM schedules 
-                    WHERE project_id = ? AND (name = ? OR ? LIKE '%' || name || '%' OR name LIKE '%' || ? || '%') AND is_active = 1
-                    """, (project_id, sheet_name, sheet_name, sheet_name))
-                    matched_sched = cursor.fetchone()
-                    sched_id = matched_sched['id'] if matched_sched else None
+                    clean_sheet_name = sheet_name.strip()
 
-                    session = attendance_manager.get_session_by_name(project_id, sheet_name, schedule_id=sched_id)
+                    # STRICT SCHEDULE RESOLUTION (NO FUZZY SUBSTRING MATCHING)
+                    sched_id = None
+                    # 1. Check explicit tag like [ID:12] or [SCHED-12]
+                    tag_match = re.search(r'\[(?:ID|SCHED)[-:]\s*(\d+)\]', clean_sheet_name, re.IGNORECASE)
+                    if tag_match:
+                        cand_id = int(tag_match.group(1))
+                        cursor.execute("SELECT id FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (cand_id, project_id))
+                        row = cursor.fetchone()
+                        if row:
+                            sched_id = cand_id
+
+                    # 2. Exact match on schedule name
+                    if sched_id is None:
+                        cursor.execute("SELECT id FROM schedules WHERE project_id = ? AND name = ? AND is_active = 1", (project_id, clean_sheet_name))
+                        row = cursor.fetchone()
+                        if row:
+                            sched_id = row['id']
+
+                    # 3. Check existing session
+                    session = attendance_manager.get_session_by_name(project_id, clean_sheet_name, schedule_id=sched_id)
                     if not session:
                         session_id = attendance_manager.create_session(
-                            project_id, sheet_name, schedule_id=sched_id, 
+                            project_id, clean_sheet_name, schedule_id=sched_id, 
                             copy_from_prev_session=False, sync_excel_sheet=False
                         )
                     else:
                         session_id = session['id']
-                        if not sched_id:
+                        if sched_id is None:
                             sched_id = session.get('schedule_id')
 
                     ws = wb[sheet_name]
@@ -279,7 +302,7 @@ class ExcelManager:
 
                         sheet_staff_ids.add(staff_id)
 
-                        # Update schedule_staff lifecycle
+                        # Update schedule_staff lifecycle (re-activation clears end_session_id)
                         if sched_id is not None:
                             cursor.execute("""
                             INSERT INTO schedule_staff (schedule_id, staff_id, start_session_id, is_active, created_at)
@@ -315,7 +338,7 @@ class ExcelManager:
                             now_iso
                         ))
 
-                    # Deactivate schedule_staff members who are removed from this sheet
+                    # Deactivate schedule_staff members who are removed from this sheet (ONLY for this schedule!)
                     if sched_id is not None and sheet_staff_ids:
                         placeholders = ','.join(['?'] * len(sheet_staff_ids))
                         cursor.execute(f"""
@@ -326,28 +349,33 @@ class ExcelManager:
 
         except Exception as err:
             logging.error(f"Excel import DB transaction failed and rolled back: {err}")
-            if os.path.exists(temp_staging):
-                os.remove(temp_staging)
+            if os.path.exists(staging_path):
+                os.remove(staging_path)
             raise err
         finally:
             conn.close()
             wb.close()
 
-        # Phase 4: Atomic Physical File Replacement (Post-Commit)
+        # Phase 4: Atomic Physical File Replacement (Post-Commit) & Verification
         try:
-            shutil.copy2(temp_staging, proj_excel_path)
+            shutil.copy2(staging_path, proj_excel_path)
+            # Verify file integrity on destination
+            chk_wb = openpyxl.load_workbook(proj_excel_path, data_only=True)
+            chk_wb.close()
             project_manager.update_project_excel_path(project_id, proj_excel_path)
         except Exception as fs_err:
-            logging.critical(f"Failed to copy staging Excel to destination: {fs_err}")
-            # Two-phase recovery
+            logging.critical(f"Failed to copy or verify staging Excel at destination: {fs_err}. Starting recovery.")
+            # Two-phase automated recovery
             if db_backup_path and os.path.exists(db_backup_path):
                 db_instance.restore_backup(db_backup_path)
-            if excel_backup_path and os.path.exists(excel_backup_path) and os.path.exists(proj_excel_path):
+            if excel_backup_path and os.path.exists(excel_backup_path):
                 shutil.copy2(excel_backup_path, proj_excel_path)
-            raise RuntimeError(f"خطا در جایگزینی فایل فیزیکی اکسل. پایگاه داده و فایل به وضعیت قبل بازگردانی شدند: {fs_err}")
+            elif os.path.exists(proj_excel_path):
+                os.remove(proj_excel_path)
+            raise RuntimeError(f"خطا در جایگزینی و اعتبارسنجی فایل اکسل. کلیه تغییرات دیتابیس و فایل به وضعیت قبل بازگردانی شدند: {fs_err}")
         finally:
-            if os.path.exists(temp_staging):
-                os.remove(temp_staging)
+            if os.path.exists(staging_path):
+                os.remove(staging_path)
 
         return True
 

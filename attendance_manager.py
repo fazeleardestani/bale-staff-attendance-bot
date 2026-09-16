@@ -63,10 +63,13 @@ class AttendanceManager:
         return True
 
     def create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
-                       schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
+                       schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True,
+                       return_details=False):
         """
         Creates a session strictly owned by its schedule if provided.
         Enforces schedule project-ownership and unique calendar identity (project_id, schedule_id, session_date).
+        If existing session found, returns (existing_id, False) when return_details=True, or existing_id.
+        If created, returns (session_id, True) when return_details=True, or session_id.
         STRICT REQUIREMENT: If schedule_id is provided, only schedule_staff is used.
         NO FALLBACK to project_staff if schedule_staff is empty.
         Atomic transaction: session + initial attendance snapshot commit together.
@@ -74,7 +77,7 @@ class AttendanceManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
 
-        # Enforce schedule ownership: schedule must belong to this project
+        # Enforce schedule ownership: schedule must belong to this project and be active
         if schedule_id is not None:
             cursor.execute("SELECT id FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (schedule_id, project_id))
             if not cursor.fetchone():
@@ -93,6 +96,9 @@ class AttendanceManager:
             existing = cursor.fetchone()
             if existing:
                 conn.close()
+                logging.info(f"Existing session found for project {project_id}, schedule {schedule_id}, date {date_str} (ID {existing['id']})")
+                if return_details:
+                    return existing['id'], False
                 return existing['id']
 
         try:
@@ -158,7 +164,19 @@ class AttendanceManager:
             except Exception as ex_err:
                 logging.warning(f"Excel sheet sync notice: {ex_err}")
 
+        if return_details:
+            return session_id, True
         return session_id
+
+    def get_or_create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
+                              schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
+        """Returns (session_id, is_created: bool) clearly indicating whether a new session was created."""
+        return self.create_session(
+            project_id, name, session_date=session_date, time_str=time_str,
+            day_of_week=day_of_week, schedule_id=schedule_id,
+            copy_from_prev_session=copy_from_prev_session,
+            sync_excel_sheet=sync_excel_sheet, return_details=True
+        )
 
     def get_session(self, session_id):
         conn = self.db.get_sqlite_connection()
@@ -213,19 +231,69 @@ class AttendanceManager:
         return [dict(r) for r in rows]
 
     def update_session_field(self, session_id, field_name, value):
+        """
+        Updates session fields strictly preserving architectural invariants:
+        1. Immutability of schedule_id if session already has attendance records.
+        2. Project ownership & active check when updating schedule_id.
+        3. Collision prevention on (project_id, schedule_id, session_date) when updating schedule_id or session_date.
+        """
         allowed = ['name', 'session_date', 'time_str', 'day_of_week', 'status', 'schedule_id']
         if field_name not in allowed:
             return False
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
-        if field_name == 'schedule_id' and value is not None:
-            cursor.execute("SELECT project_id FROM sessions WHERE id = ?", (session_id,))
-            s_row = cursor.fetchone()
-            if s_row:
-                cursor.execute("SELECT 1 FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (value, s_row['project_id']))
-                if not cursor.fetchone():
+
+        cursor.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        sess = cursor.fetchone()
+        if not sess:
+            conn.close()
+            raise ValueError("جلسه مورد نظر یافت نشد.")
+
+        project_id = sess['project_id']
+        current_sched_id = sess['schedule_id']
+        current_date = sess['session_date']
+
+        # P0 Requirement 1: Schedule Immutability if Attendance Exists & Project Ownership
+        if field_name == 'schedule_id':
+            if value != current_sched_id:
+                cursor.execute("SELECT COUNT(*) FROM attendance WHERE session_id = ?", (session_id,))
+                att_cnt = cursor.fetchone()[0]
+                if att_cnt > 0:
+                    conn.close()
+                    raise ValueError("تغییر برنامه/کلاس برای جلسه‌ای که دارای سابقه حضور و غیاب است غیرمجاز می‌باشد.")
+
+            if value is not None:
+                cursor.execute("SELECT id, project_id, is_active FROM schedules WHERE id = ?", (value,))
+                sched = cursor.fetchone()
+                if not sched or sched['project_id'] != project_id:
                     conn.close()
                     raise ValueError("برنامه انتخابی متعلق به این پروژه نیست.")
+                if not sched['is_active']:
+                    conn.close()
+                    raise ValueError("برنامه انتخابی غیرفعال است و امکان اتصال جلسه به آن وجود ندارد.")
+
+                # Collision check on (project_id, schedule_id, session_date)
+                if current_date:
+                    cursor.execute("""
+                    SELECT id FROM sessions 
+                    WHERE project_id = ? AND schedule_id = ? AND session_date = ? AND id != ? AND status != 'CANCELLED'
+                    """, (project_id, value, current_date, session_id))
+                    if cursor.fetchone():
+                        conn.close()
+                        raise ValueError(f"در تاریخ {current_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+
+        # P0 Requirement 2: Collision check on session_date
+        if field_name == 'session_date':
+            new_date = str(value or '').strip()
+            if current_sched_id is not None and new_date:
+                cursor.execute("""
+                SELECT id FROM sessions 
+                WHERE project_id = ? AND schedule_id = ? AND session_date = ? AND id != ? AND status != 'CANCELLED'
+                """, (project_id, current_sched_id, new_date, session_id))
+                if cursor.fetchone():
+                    conn.close()
+                    raise ValueError(f"در تاریخ {new_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+
         cursor.execute(f"UPDATE sessions SET {field_name} = ? WHERE id = ?", (value, session_id))
         conn.commit()
         conn.close()
@@ -245,7 +313,7 @@ class AttendanceManager:
         """
         Pure read of historical attendance with immutable snapshots.
         STRICT REQUIREMENT: Absolutely NO silent automatic re-seeding of old sessions.
-        Reads exclusively from attendance snapshot fields.
+        Reads exclusively from attendance snapshot fields. Logs warning if snapshot is missing.
         """
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
@@ -253,13 +321,13 @@ class AttendanceManager:
         cursor.execute("""
         SELECT 
             s.id as staff_id, s.project_id, 
-            COALESCE(NULLIF(a.staff_name_snapshot, ''), '[نامشخص]') as name,
+            a.staff_name_snapshot,
             s.phone, 
-            COALESCE(NULLIF(a.unit_snapshot, ''), '-') as unit,
-            COALESCE(NULLIF(a.section_snapshot, ''), '-') as section,
-            COALESCE(NULLIF(a.position_snapshot, ''), 'نیرو') as position,
+            a.unit_snapshot,
+            a.section_snapshot,
+            a.position_snapshot,
             s.card_title, s.shift_time, 
-            COALESCE(NULLIF(a.gender_snapshot, ''), '') as gender,
+            a.gender_snapshot,
             s.notes as staff_notes,
             s.is_multi_section, s._excel_row, s.staff_code,
             s.start_session_id, s.end_session_id,
@@ -276,7 +344,23 @@ class AttendanceManager:
         """, (project_id, session_id))
         rows = cursor.fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            if not d.get('staff_name_snapshot'):
+                logging.warning(f"Data integrity warning: attendance record {d.get('attendance_id')} for staff {d.get('staff_id')} in session {session_id} has missing snapshot!")
+                d['name'] = '[ثبت نشده]'
+            else:
+                d['name'] = d['staff_name_snapshot']
+
+            d['unit'] = d.get('unit_snapshot') or '-'
+            d['section'] = d.get('section_snapshot') or '-'
+            d['position'] = d.get('position_snapshot') or 'نیرو'
+            d['gender'] = d.get('gender_snapshot') or ''
+            result.append(d)
+
+        return result
 
     def seed_session_roster_explicit(self, project_id, session_id, actor_user_id):
         """
@@ -351,13 +435,13 @@ class AttendanceManager:
         cursor.execute("""
         SELECT 
             s.id as staff_id, s.project_id, 
-            COALESCE(NULLIF(a.staff_name_snapshot, ''), '[نامشخص]') as name,
+            a.staff_name_snapshot,
             s.phone, 
-            COALESCE(NULLIF(a.unit_snapshot, ''), '-') as unit,
-            COALESCE(NULLIF(a.section_snapshot, ''), '-') as section,
-            COALESCE(NULLIF(a.position_snapshot, ''), 'نیرو') as position,
+            a.unit_snapshot,
+            a.section_snapshot,
+            a.position_snapshot,
             s.card_title, s.shift_time, 
-            COALESCE(NULLIF(a.gender_snapshot, ''), '') as gender,
+            a.gender_snapshot,
             s.notes as staff_notes,
             s.is_multi_section, s._excel_row, s.staff_code,
             s.start_session_id, s.end_session_id,
@@ -371,7 +455,15 @@ class AttendanceManager:
         """, (project_id, session_id, staff_id))
         row = cursor.fetchone()
         conn.close()
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        d['name'] = d.get('staff_name_snapshot') or '[ثبت نشده]'
+        d['unit'] = d.get('unit_snapshot') or '-'
+        d['section'] = d.get('section_snapshot') or '-'
+        d['position'] = d.get('position_snapshot') or 'نیرو'
+        d['gender'] = d.get('gender_snapshot') or ''
+        return d
 
     def update_attendance_status(self, project_id, session_id, staff_id, status_val, actor_user_id=None, sync_same_phone=True):
         if actor_user_id is not None:

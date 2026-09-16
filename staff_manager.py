@@ -18,7 +18,14 @@ class StaffManager:
         c_title = card_title if card_title is not None else section
         clean_code = str(staff_code).strip() if staff_code else None
 
-        # If clean_code exists, verify if staff already exists in this project
+        # If schedule_id is provided, verify it belongs to this project
+        if schedule_id is not None:
+            cursor.execute("SELECT id FROM schedules WHERE id = ? AND project_id = ? AND is_active = 1", (schedule_id, project_id))
+            if not cursor.fetchone():
+                conn.close()
+                raise ValueError(f"برنامه {schedule_id} متعلق به پروژه {project_id} نیست.")
+
+        # If clean_code exists, check if staff already exists in this project
         if clean_code:
             cursor.execute("SELECT id FROM project_staff WHERE project_id = ? AND staff_code = ?", (project_id, clean_code))
             existing = cursor.fetchone()
@@ -36,9 +43,9 @@ class StaffManager:
                 """, (name.strip(), str(phone or '').strip(), unit.strip(), section.strip(), position.strip(),
                       str(c_title).strip(), str(shift_time or '').strip(), gender.strip(), notes.strip(), staff_id))
                 conn.commit()
+                conn.close()
                 if schedule_id:
                     self.assign_staff_to_schedule(schedule_id, staff_id, start_session_id, end_session_id)
-                conn.close()
                 return staff_id
 
         cursor.execute("""
@@ -82,9 +89,21 @@ class StaffManager:
         return dict(row) if row else None
 
     def assign_staff_to_schedule(self, schedule_id, staff_id, start_session_id=None, end_session_id=None):
-        """Explicitly assigns a staff member to a specific schedule / class / level."""
+        """Explicitly assigns a staff member to a specific schedule. Verifies project matching."""
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
+
+        # Enforce project alignment: schedule and staff must share the same project_id
+        cursor.execute("""
+        SELECT s.project_id as sched_proj, ps.project_id as staff_proj
+        FROM schedules s, project_staff ps
+        WHERE s.id = ? AND ps.id = ?
+        """, (schedule_id, staff_id))
+        row = cursor.fetchone()
+        if not row or row['sched_proj'] != row['staff_proj']:
+            conn.close()
+            raise ValueError("برنامه و نیرو متعلق به یک پروژه یکسان نیستند و امکان انتساب وجود ندارد.")
+
         now_iso = datetime.now().isoformat()
         cursor.execute("""
         INSERT INTO schedule_staff (schedule_id, staff_id, start_session_id, end_session_id, is_active, created_at)
@@ -138,18 +157,15 @@ class StaffManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         
-        # If schedule_id is provided and that schedule has explicit schedule_staff assignments
+        # If schedule_id is provided, resolve exclusively from schedule_staff
         if schedule_id is not None:
-            cursor.execute("SELECT COUNT(*) FROM schedule_staff WHERE schedule_id = ? AND is_active = 1", (schedule_id,))
-            cnt = cursor.fetchone()[0]
-            if cnt > 0:
-                conn.close()
-                s_list = self.list_schedule_staff(schedule_id, session_id=session_id, active_only=active_only)
-                if unit:
-                    s_list = [s for s in s_list if s.get('unit') == unit]
-                if section:
-                    s_list = [s for s in s_list if s.get('section') == section]
-                return s_list
+            conn.close()
+            s_list = self.list_schedule_staff(schedule_id, session_id=session_id, active_only=active_only)
+            if unit:
+                s_list = [s for s in s_list if s.get('unit') == unit]
+            if section:
+                s_list = [s for s in s_list if s.get('section') == section]
+            return s_list
 
         query = "SELECT * FROM project_staff WHERE project_id = ?"
         params = [project_id]

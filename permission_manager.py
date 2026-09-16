@@ -315,13 +315,13 @@ class PermissionManager:
     def authorize_attendance_action(self, actor_user_id, project_id, session_id=None, staff_id=None, action="view"):
         """
         Centralized, multi-layered authorization service.
-        Validates:
+        STRICT CHECKS:
         1. Actor identity and active status.
         2. Global super admin override.
         3. Project existence and actor project-membership.
         4. Session ownership within project and cancelled status check.
-        5. Staff ownership within project, attendance presence, and gender scope.
-        6. Role permissions according to action type.
+        5. Staff ownership within project, gender scope, unit scope.
+        6. STRICT SESSION ROSTER ENROLLMENT (P0): Staff MUST be in attendance of session_id.
         """
         user = self.get_user(actor_user_id)
         if not user or not user.get('is_active', 1):
@@ -329,6 +329,15 @@ class PermissionManager:
 
         # Global Super Admin override
         if user.get('is_global_super_admin', 0):
+            # Still validate session and staff existence even for super_admin to prevent data pollution
+            if session_id is not None and staff_id is not None and action in ("update_attendance", "update_card", "add_late", "edit_desc"):
+                conn = self.db.get_sqlite_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM attendance WHERE project_id = ? AND session_id = ? AND staff_id = ?", (project_id, session_id, staff_id))
+                in_roster = cursor.fetchone()
+                conn.close()
+                if not in_roster:
+                    return False, "نیرو در لیست حضور و غیاب این جلسه عضو نیست", "super_admin"
             return True, "دسترسی مدیر ارشد کل سامانه", "super_admin"
 
         if not project_id:
@@ -339,11 +348,10 @@ class PermissionManager:
         if not is_active or not role:
             return False, "کاربر عضو این پروژه نیست یا دسترسی او معلق شده است", None
 
-        # Project Admins have full access within project
+        # Role action permissions
         if role in ('super_admin', 'admin'):
-            pass  # proceed to session validation
+            pass
         elif role == 'unit_head':
-            # Unit head can view unit staff, view unit attendance, and request shortage
             allowed_unit_actions = ["view_unit_staff", "view_unit_attendance", "request_shortage", "view"]
             if action not in allowed_unit_actions and not action.startswith("view"):
                 return False, "مسئول واحد مجاز به تغییر مستقیم حضور یا کارت نیست", role
@@ -384,10 +392,23 @@ class PermissionManager:
                 if actor_gender and staff_gender and actor_gender != staff_gender:
                     return False, f"عدم تطابق جنسیتی: اپراتور {actor_gender} مجاز به تغییر وضعیت نیروی {staff_gender} نیست", role
 
+            # STRICT SESSION ROSTER ENROLLMENT (P0):
+            # Staff must actually be present in this session's attendance table!
+            if session_id is not None and action in ("update_attendance", "update_card", "add_late", "edit_desc", "view_staff_attendance"):
+                conn = self.db.get_sqlite_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                SELECT 1 FROM attendance 
+                WHERE project_id = ? AND session_id = ? AND staff_id = ?
+                """, (project_id, session_id, staff_id))
+                in_roster = cursor.fetchone()
+                conn.close()
+                if not in_roster:
+                    return False, "نیرو در لیست حضور و غیاب این جلسه عضو نیست و امکان ثبت وضعیت برای او وجود ندارد", role
+
         return True, "دسترسی مجاز", role
 
     def check_staff_access(self, project_id, user_id, staff_id):
-        """Convenience alias delegating to authorize_attendance_action."""
         return self.authorize_attendance_action(user_id, project_id, None, staff_id, action="edit_staff")
 
     def record_operator_daily_absence(self, project_id, user_id, absent_date=None):

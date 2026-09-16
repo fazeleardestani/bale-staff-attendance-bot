@@ -43,7 +43,7 @@ LOGS_DIR = os.path.join(BASE_PATH, "logs")
 for d in [DATA_DIR, PROJECT_FILES_DIR, DB_BACKUPS_DIR, EXCEL_BACKUPS_DIR, ARCHIVES_DIR, LOGS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-DEFAULT_SQLITE_PATH = os.getenv("SQLITE_PATH", os.path.join(DATA_DIR, "bot_cache.db"))
+DEFAULT_SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/bot_cache.db")
 
 BALE_API_URL = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot{0}/{1}")
 BALE_FILE_URL = os.getenv("BALE_FILE_URL", "https://tapi.bale.ai/file/bot{0}/{1}")

@@ -4,6 +4,7 @@ import sqlite3
 import shutil
 import threading
 import logging
+import tempfile
 from datetime import datetime
 from config import (
     DEFAULT_SQLITE_PATH, MYSQL_ENABLED, MYSQL_HOST, MYSQL_USER, 
@@ -332,8 +333,11 @@ class DatabaseManager:
                 for uid in SUPER_ADMINS:
                     cursor.execute("""
                     INSERT INTO users (user_id, staff_name, gender, is_global_super_admin, is_active, created_at)
-                    VALUES (?, ?, 'خانم', 1, 1, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET is_global_super_admin=1, is_active=1
+                    VALUES (?, ?, 'نامشخص', 1, 1, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        is_global_super_admin=1,
+                        is_active=1,
+                        staff_name = CASE WHEN users.staff_name LIKE 'مدیر ارشد %' THEN excluded.staff_name ELSE users.staff_name END
                     """, (uid, f"مدیر ارشد {uid}", now_iso))
 
                 # Verify schema version update atomically
@@ -475,7 +479,7 @@ class DatabaseManager:
                 backup_name = f"bot_cache_{label}_{timestamp}.db"
                 target_path = os.path.join(category_dir, backup_name)
 
-                temp_target = os.path.join("/tmp", f"tmp_bkp_{timestamp}_{os.getpid()}.db")
+                temp_target = os.path.join(tempfile.gettempdir(), f"tmp_bkp_{timestamp}_{os.getpid()}.db")
                 source_conn = self.get_sqlite_connection()
                 dest_conn = sqlite3.connect(temp_target)
                 with dest_conn:

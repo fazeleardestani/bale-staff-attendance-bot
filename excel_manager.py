@@ -189,7 +189,7 @@ class ExcelManager:
                 # 2. Shortages
                 if "تامین نیرو" in wb.sheetnames:
                     ws_sh = wb["تامین نیرو"]
-                    cursor.execute("DELETE FROM shortages WHERE project_id = ?", (project_id,))
+                    cursor.execute("DELETE FROM shortages WHERE project_id = ? AND status = 'تامین نشده'", (project_id,))
                     for r in range(2, ws_sh.max_row + 1):
                         u = str(ws_sh.cell(row=r, column=2).value or "").strip()
                         s = str(ws_sh.cell(row=r, column=3).value or "").strip()
@@ -201,7 +201,7 @@ class ExcelManager:
                         if u and u not in ("None", ""):
                             cursor.execute("""
                             INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
-                            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 1, ?)
+                            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?)
                             """, (project_id, u, s, target_grp, desc, st or 'تامین نشده', assigned_name, phone, r, now_iso))
 
                 # 3. Sheets -> Schedule Staff Lifecycle & Session Attendance
@@ -350,20 +350,20 @@ class ExcelManager:
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
-                            status = excluded.status,
-                            card_status = excluded.card_status,
-                            late_tracking = excluded.late_tracking,
-                            description = excluded.description,
-                            staff_name_snapshot = excluded.staff_name_snapshot,
-                            unit_snapshot = excluded.unit_snapshot,
-                            section_snapshot = excluded.section_snapshot,
-                            position_snapshot = excluded.position_snapshot,
-                            gender_snapshot = excluded.gender_snapshot,
-                            phone_snapshot = excluded.phone_snapshot,
-                            card_title_snapshot = excluded.card_title_snapshot,
-                            shift_time_snapshot = excluded.shift_time_snapshot,
-                            is_multi_section_snapshot = excluded.is_multi_section_snapshot,
-                            staff_code_snapshot = excluded.staff_code_snapshot,
+                            status = CASE WHEN excluded.status != '' THEN excluded.status ELSE attendance.status END,
+                            card_status = CASE WHEN excluded.card_status != '' THEN excluded.card_status ELSE attendance.card_status END,
+                            late_tracking = CASE WHEN excluded.late_tracking != '' THEN excluded.late_tracking ELSE attendance.late_tracking END,
+                            description = CASE WHEN excluded.description != '' THEN excluded.description ELSE attendance.description END,
+                            staff_name_snapshot = CASE WHEN attendance.staff_name_snapshot IS NULL OR attendance.staff_name_snapshot = '' THEN excluded.staff_name_snapshot ELSE attendance.staff_name_snapshot END,
+                            unit_snapshot = CASE WHEN attendance.unit_snapshot IS NULL OR attendance.unit_snapshot = '' THEN excluded.unit_snapshot ELSE attendance.unit_snapshot END,
+                            section_snapshot = CASE WHEN attendance.section_snapshot IS NULL OR attendance.section_snapshot = '' THEN excluded.section_snapshot ELSE attendance.section_snapshot END,
+                            position_snapshot = CASE WHEN attendance.position_snapshot IS NULL OR attendance.position_snapshot = '' THEN excluded.position_snapshot ELSE attendance.position_snapshot END,
+                            gender_snapshot = CASE WHEN attendance.gender_snapshot IS NULL OR attendance.gender_snapshot = '' THEN excluded.gender_snapshot ELSE attendance.gender_snapshot END,
+                            phone_snapshot = CASE WHEN attendance.phone_snapshot IS NULL OR attendance.phone_snapshot = '' THEN excluded.phone_snapshot ELSE attendance.phone_snapshot END,
+                            card_title_snapshot = CASE WHEN attendance.card_title_snapshot IS NULL OR attendance.card_title_snapshot = '' THEN excluded.card_title_snapshot ELSE attendance.card_title_snapshot END,
+                            shift_time_snapshot = CASE WHEN attendance.shift_time_snapshot IS NULL OR attendance.shift_time_snapshot = '' THEN excluded.shift_time_snapshot ELSE attendance.shift_time_snapshot END,
+                            is_multi_section_snapshot = CASE WHEN attendance.is_multi_section_snapshot IS NULL OR attendance.is_multi_section_snapshot = '' THEN excluded.is_multi_section_snapshot ELSE attendance.is_multi_section_snapshot END,
+                            staff_code_snapshot = CASE WHEN attendance.staff_code_snapshot IS NULL OR attendance.staff_code_snapshot = '' THEN excluded.staff_code_snapshot ELSE attendance.staff_code_snapshot END,
                             updated_at = excluded.updated_at
                         """, (
                             project_id, session_id, staff_id, att_st, card_st, late_trk, desc,
@@ -435,11 +435,28 @@ class ExcelManager:
             ws = wb[sheet_name]
             header_map = {str(ws.cell(row=1, column=c).value).strip(): c for c in range(1, 100) if ws.cell(row=1, column=c).value}
             att_records = attendance_manager.get_session_attendance(project_id, sess['id'])
+
+            # Build row lookup by (name, unit, section) from existing sheet data
+            row_lookup = {}
+            name_col = header_map.get("نام و نام خانوادگی")
+            unit_col = header_map.get("واحد")
+            sec_col = header_map.get("بخش")
+            if name_col:
+                for ri in range(2, ws.max_row + 1):
+                    n_val = str(ws.cell(row=ri, column=name_col).value or "").strip()
+                    u_val = str(ws.cell(row=ri, column=unit_col).value or "").strip() if unit_col else ""
+                    s_val = str(ws.cell(row=ri, column=sec_col).value or "").strip() if sec_col else ""
+                    if n_val:
+                        row_lookup[(n_val, u_val, s_val)] = ri
+
             for rec in att_records:
-                r_idx = rec.get('_excel_row')
-                if not r_idx or r_idx > ws.max_row:
+                rec_name = str(rec.get("name") or "").strip()
+                rec_unit = str(rec.get("unit") or "").strip()
+                rec_section = str(rec.get("section") or "").strip()
+                r_idx = row_lookup.get((rec_name, rec_unit, rec_section))
+                if not r_idx:
                     r_idx = ws.max_row + 1
-                    rec['_excel_row'] = r_idx
+                    row_lookup[(rec_name, rec_unit, rec_section)] = r_idx
 
                 if "نام و نام خانوادگی" in header_map: ws.cell(row=r_idx, column=header_map["نام و نام خانوادگی"]).value = rec.get("name")
                 if "کد پرسنلی" in header_map: ws.cell(row=r_idx, column=header_map["کد پرسنلی"]).value = rec.get("staff_code")

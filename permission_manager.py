@@ -260,7 +260,7 @@ class PermissionManager:
         INSERT INTO user_context (user_id, current_project_id, current_session_id, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-            current_project_id = COALESCE(excluded.current_project_id, user_context.current_project_id),
+            current_project_id = excluded.current_project_id,
             current_session_id = excluded.current_session_id,
             updated_at = excluded.updated_at
         """, (user_id, project_id, session_id, now_iso))

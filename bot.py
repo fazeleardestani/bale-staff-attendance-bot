@@ -154,6 +154,9 @@ def get_user_active_project_and_session(user_id):
     if pid:
         sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
         if not sessions:
+            proj_info = project_manager.get_project(pid)
+            if proj_info and proj_info.get('type') == 'کلاس':
+                return pid, None
             sid = attendance_manager.create_session(pid, "روز 1")
             permission_manager.set_user_context(user_id, project_id=pid, session_id=sid)
         else:
@@ -196,7 +199,19 @@ def send_welcome(message):
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     for p in projects:
-        icon = "🌱" if p.get('type') == 'کلاس' else "🏛" if p.get('type') == 'همایش' else "🏕" if p.get('type') == 'اردو' else "🏴" if p.get('type') == 'مراسم' else "🏢"
+        ptype = p.get('type', 'عمومی')
+        if ptype == 'کلاس':
+            icon = "🌱"
+        elif ptype in ('همایش', 'کارگاه', 'همایش/کارگاه'):
+            icon = "🏛"
+        elif ptype == 'اردو':
+            icon = "🏕"
+        elif ptype == 'هیئت':
+            icon = "🏴"
+        elif ptype == 'متفرقه':
+            icon = "📦"
+        else:
+            icon = "🏢"
         markup.add(types.InlineKeyboardButton(f"{icon} {p['name']} ({p.get('type', 'عمومی')})", callback_data=f"selproj_{p['id']}"))
 
     if is_global_admin:

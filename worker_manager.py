@@ -185,7 +185,8 @@ class WorkerManager:
                     if self.bot:
                         members = permission_manager.get_project_members(pid)
                         for m in members:
-                            if m['is_active'] and m.get('role') != 'unit_head' and (m['role'] in ('admin', 'super_admin') or m['project_gender'] == target_grp):
+                            gender_match = (target_grp == 'عمومی') or (m.get('project_gender') == target_grp)
+                            if m['is_active'] and m.get('role') != 'unit_head' and (m['role'] in ('admin', 'super_admin') or gender_match):
                                 if permission_manager.is_operator_absent_today(pid, m['user_id']):
                                     continue
                                 try:

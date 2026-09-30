@@ -561,18 +561,26 @@ class AttendanceManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
 
+        # STRICT PHONE SYNC: Use phone_snapshot from attendance record (FIX 7)
+        # Get the snapshot phone for this staff in this session (may differ from live phone)
+        cursor.execute(
+            "SELECT phone_snapshot FROM attendance WHERE project_id = ? AND session_id = ? AND staff_id = ?",
+            (project_id, session_id, staff_id)
+        )
+        snap_row = cursor.fetchone()
+        if snap_row and snap_row['phone_snapshot']:
+            phone = str(snap_row['phone_snapshot']).strip()
+
         # STRICT PHONE SYNC: Query attendance table of THIS session only
         if sync_same_phone and phone and phone not in ("None", "-", ""):
             cursor.execute("""
             SELECT a.staff_id
             FROM attendance a
-            JOIN project_staff s ON s.id = a.staff_id
             WHERE a.project_id = ?
               AND a.session_id = ?
-              AND s.phone = ?
-              AND s.phone != ''
-              AND s.phone IS NOT NULL
-              AND s.is_active = 1
+              AND a.phone_snapshot = ?
+              AND a.phone_snapshot != ''
+              AND a.phone_snapshot IS NOT NULL
             """, (project_id, session_id, phone))
             matched = [r[0] for r in cursor.fetchall()]
             if matched:
@@ -615,18 +623,25 @@ class AttendanceManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
 
+        # STRICT PHONE SYNC: Use phone_snapshot from attendance record (FIX 7)
+        cursor.execute(
+            "SELECT phone_snapshot FROM attendance WHERE project_id = ? AND session_id = ? AND staff_id = ?",
+            (project_id, session_id, staff_id)
+        )
+        snap_row = cursor.fetchone()
+        if snap_row and snap_row['phone_snapshot']:
+            phone = str(snap_row['phone_snapshot']).strip()
+
         # STRICT PHONE SYNC: Query attendance table of THIS session only
         if sync_same_phone and phone and phone not in ("None", "-", ""):
             cursor.execute("""
             SELECT a.staff_id
             FROM attendance a
-            JOIN project_staff s ON s.id = a.staff_id
             WHERE a.project_id = ?
               AND a.session_id = ?
-              AND s.phone = ?
-              AND s.phone != ''
-              AND s.phone IS NOT NULL
-              AND s.is_active = 1
+              AND a.phone_snapshot = ?
+              AND a.phone_snapshot != ''
+              AND a.phone_snapshot IS NOT NULL
             """, (project_id, session_id, phone))
             matched = [r[0] for r in cursor.fetchall()]
             if matched:

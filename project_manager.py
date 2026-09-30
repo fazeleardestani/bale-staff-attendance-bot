@@ -22,6 +22,7 @@ if not any(isinstance(f, _DirectFinder) for f in sys.meta_path):
 from datetime import datetime
 from config import PROJECT_FILES_DIR, ARCHIVES_DIR, BASE_PATH
 from db_manager import db_instance
+import logging
 import shutil
 
 class ProjectManager:
@@ -126,8 +127,19 @@ class ProjectManager:
                 time_str=activation_time or "16:00"
             )
             
+            # Find first occurrence of the class day on or after base_dt
+            class_start_dt = base_dt
+            valid_days = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنج‌شنبه", "جمعه"]
+            if recurring_days and recurring_days.strip() in valid_days:
+                from utils import get_persian_weekday
+                for offset in range(7):
+                    candidate = base_dt + timedelta(days=offset)
+                    if get_persian_weekday(candidate) == recurring_days.strip():
+                        class_start_dt = candidate
+                        break
+
             for i in range(1, num_sessions + 1):
-                sess_dt = base_dt + timedelta(days=7 * (i - 1))
+                sess_dt = class_start_dt + timedelta(days=7 * (i - 1))
                 sess_date_str = sess_dt.strftime("%Y-%m-%d")
                 sess_id = attendance_manager.create_session(
                     project_id, name=f"جلسه {i}", session_date=sess_date_str,

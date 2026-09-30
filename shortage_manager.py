@@ -151,7 +151,7 @@ class ShortageManager:
         conn = self.db.get_sqlite_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("UPDATE shortages SET status = 'تامین نشده', is_notified = 1 WHERE id = ?", (shortage_id,))
+            cursor.execute("UPDATE shortages SET status = 'تامین نشده', is_notified = 0 WHERE id = ?", (shortage_id,))
             conn.commit()
             return True
         except Exception:

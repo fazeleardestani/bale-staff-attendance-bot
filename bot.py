@@ -2,6 +2,7 @@ import os
 import sys
 import importlib.abc
 import importlib.util
+import re
 
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
@@ -157,8 +158,13 @@ def get_user_active_project_and_session(user_id):
             proj_info = project_manager.get_project(pid)
             if proj_info and proj_info.get('type') == 'کلاس':
                 return pid, None
-            sid = attendance_manager.create_session(pid, "روز 1")
-            permission_manager.set_user_context(user_id, project_id=pid, session_id=sid)
+                
+            role, _, _, _, _ = permission_manager.get_user_project_role(pid, user_id)
+            if role in ('admin', 'super_admin'):
+                sid = attendance_manager.create_session(pid, "روز 1")
+                permission_manager.set_user_context(user_id, project_id=pid, session_id=sid)
+            else:
+                return pid, None
         else:
             session_ids = [s['id'] for s in sessions]
             if sid not in session_ids:
@@ -247,7 +253,6 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
     sess = attendance_manager.get_session(session_id)
     sess_name = sess['name'] if sess else "نامشخص"
 
-    # Dedicated Limited Menu for Unit Head (مسئول واحد)
     if role == "unit_head":
         unit_label = assigned_unit or "نامشخص"
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -336,8 +341,6 @@ def handle_callbacks(call):
     data = call.data
     log_callback(chat_id, data)
 
-    # Initialize all context & role variables globally at the start of handle_callbacks
-    # to guarantee UnboundLocalError is physically impossible anywhere in callbacks
     user = permission_manager.get_user(chat_id)
     is_global = user.get('is_global_super_admin', 0) if user else 0
     pid, sid = get_user_active_project_and_session(chat_id)
@@ -348,9 +351,6 @@ def handle_callbacks(call):
             try: bot.answer_callback_query(call.id)
             except Exception: pass
 
-        # ==========================================
-        # 1. Global / Project-Independent Callbacks
-        # ==========================================
         if data == "toggle_my_daily_absence":
             is_abs = permission_manager.is_operator_absent_today(pid, chat_id)
             if is_abs:
@@ -363,6 +363,7 @@ def handle_callbacks(call):
             return
 
         if data == "menu_switch_project":
+            bot_state.pop(chat_id, None)
             permission_manager.set_user_context(chat_id, project_id=None, session_id=None)
             send_welcome(call.message)
             return
@@ -376,9 +377,6 @@ def handle_callbacks(call):
             show_project_menu(chat_id, pid, sid, call.message.message_id)
             return
 
-        # ----------------------------------------------------
-        # Global: HR Fixed Staff Pool (معاونت سرمایه انسانی / امور کادر)
-        # ----------------------------------------------------
         if data in ("menu_global_operators", "menu_hr_members"):
             user = permission_manager.get_user(chat_id)
             if not user or not user.get('is_global_super_admin', 0):
@@ -557,8 +555,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_global_add_user_id)
             return
 
-        # Smart Project Creation Wizard
-        # ----------------------------------------------------
         if data == "menu_new_project_prompt":
             user = permission_manager.get_user(chat_id)
             if not user or not user.get('is_global_super_admin', 0):
@@ -570,7 +566,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_wiz_project_name)
             return
 
-        # Wizard: Type Selection
         if data.startswith("wiz_type_"):
             ptype = data.replace("wiz_type_", "")
             st = bot_state.get(chat_id, {})
@@ -579,7 +574,6 @@ def handle_callbacks(call):
             pname = st.get('name', 'پروژه')
 
             if ptype == 'کلاس':
-                # Class flow: Ask for recurring days
                 markup = types.InlineKeyboardMarkup(row_width=3)
                 days = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنج‌شنبه", "جمعه"]
                 for d in days:
@@ -588,7 +582,6 @@ def handle_callbacks(call):
                 bot.edit_message_text(f"🌱 پروژه کلاسی: **{pname}**\n\n**مرحله ۳:** روز برگزاری کلاس را انتخاب فرمایید:\n_(یا می‌توانید روزها را به صورت متن ارسال کنید، مثلاً: «یکشنبه‌ها»)_",
                                       chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             else:
-                # Event / Ceremony / Camp flow: Ask for Start Date
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 markup.add(types.InlineKeyboardButton(f"📅 امروز ({today_str})", callback_data="wiz_start_today"))
@@ -598,29 +591,25 @@ def handle_callbacks(call):
                 bot.register_next_step_handler(msg, process_wiz_start_date_text)
             return
 
-        # Class Flow: Day Selected
         if data.startswith("wiz_day_"):
             day_val = data.replace("wiz_day_", "")
             bot_state[chat_id]['recurring_days'] = day_val
-            msg = bot.send_message(chat_id, f"🗓 روز برگزاری: **{day_val}**\n\n**مرحله ۴:** لطفاً **ساعت شروع و فعال‌سازی کلاس** را با فرمت `HH:MM` وارد فرمایید:\n(مثلاً: `16:00` یا `08:30`)", parse_mode="Markdown")
+            msg = bot.send_message(chat_id, f"🗓 روز برگزاری: **{day_val}**\n\n**مرحله ۴:** لطفاً **ساعت شروع و فعال‌‌سازی کلاس** را با فرمت `HH:MM` وارد فرمایید:\n(مثلاً: `16:00` یا `08:30`)", parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_wiz_class_time)
             return
 
-        # Class Flow: Session Count Quick Buttons
         if data.startswith("wiz_cnt_"):
             cnt_val = int(data.replace("wiz_cnt_", ""))
             bot_state[chat_id]['total_sessions'] = cnt_val
             finalize_smart_project_creation(chat_id)
             return
 
-        # Event Flow: Start Today Button
         if data == "wiz_start_today":
             today_str = datetime.now().strftime("%Y-%m-%d")
             bot_state[chat_id]['start_date'] = today_str
             ask_wiz_end_date(chat_id, today_str)
             return
 
-        # Event Flow: End Sameday Button
         if data == "wiz_end_sameday":
             sdate = bot_state.get(chat_id, {}).get('start_date', '')
             bot_state[chat_id]['end_date'] = sdate
@@ -628,14 +617,12 @@ def handle_callbacks(call):
             ask_wiz_prep_day(chat_id)
             return
 
-        # Event Flow: Prep Day Selection
         if data.startswith("wiz_prep_"):
             has_prep = data.replace("wiz_prep_", "") == "1"
             bot_state[chat_id]['has_prep_day'] = has_prep
             finalize_smart_project_creation(chat_id)
             return
 
-        # Archived Projects
         if data == "menu_archived_projects":
             user = permission_manager.get_user(chat_id)
             if not user or not user.get('is_global_super_admin', 0):
@@ -664,10 +651,6 @@ def handle_callbacks(call):
             send_welcome(call.message)
             return
 
-        # ==========================================
-        # 2. Project-Scoped Callbacks (Require pid)
-        # ==========================================
-        pid, sid = get_user_active_project_and_session(chat_id)
         if not pid:
             logger.warning(f"User {chat_id} had no active project context for '{data}'. Redirecting to welcome.")
             send_welcome(call.message)
@@ -678,7 +661,6 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "دسترسی غیرمجاز", show_alert=True)
             return
 
-# --- Project Management & Settings ---
         if data == "menu_manage_project":
             if role != "super_admin" and not is_global: return
             proj = project_manager.get_project(pid)
@@ -777,7 +759,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_edit_project_desc, target_pid)
             return
 
-        # Class text report
         if data == "menu_class_text_report":
             if role not in ("admin", "super_admin"): return
             rep_text = report_manager.generate_class_text_report(pid, sid)
@@ -790,7 +771,6 @@ def handle_callbacks(call):
                 bot.send_message(chat_id, rep_text, reply_markup=markup)
             return
 
-        # Approving / Rejecting candidate suggested for shortage
         if data.startswith("apprshrt_"):
             parts = data.split("_")
             sh_id = int(parts[1])
@@ -835,12 +815,10 @@ def handle_callbacks(call):
                 except Exception: pass
             return
 
-
         if data == "start_menu":
             show_project_menu(chat_id, pid, sid, call.message.message_id)
             return
 
-        # Change session
         if data == "menu_change_session":
             sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -859,7 +837,6 @@ def handle_callbacks(call):
             show_project_menu(chat_id, pid, new_sid, call.message.message_id)
             return
 
-        # Manage sessions: List all sessions
         if data == "menu_manage_sessions":
             if role != "super_admin": return
             sessions = attendance_manager.list_sessions(pid, include_cancelled=True)
@@ -877,14 +854,12 @@ def handle_callbacks(call):
             bot.edit_message_text("🗓 **مدیریت جلسات پروژه:**\nبرای مشاهده جزییات و ویرایش اطلاعات هر جلسه روی آن کلیک فرمایید:", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # Session Detail View
         if data.startswith("sess_detail_"):
             if role != "super_admin": return
             target_sid = int(data.replace("sess_detail_", ""))
             show_session_details(chat_id, pid, target_sid, call.message.message_id)
             return
 
-        # Toggle Session Status (Cancel / Reactivate)
         if data.startswith("togglesess_"):
             if role != "super_admin": return
             target_sid = int(data.replace("togglesess_", ""))
@@ -893,7 +868,6 @@ def handle_callbacks(call):
             show_session_details(chat_id, pid, target_sid, call.message.message_id)
             return
 
-        # Edit Session Field Callbacks
         if data.startswith("editsess_"):
             if role != "super_admin": return
             parts = data.split("_")
@@ -905,6 +879,7 @@ def handle_callbacks(call):
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data=f"sess_detail_{target_sid}")))
             bot.register_next_step_handler(msg, process_edit_session_field, target_sid, db_col)
             return
+
         if data == "add_new_session_prompt":
             if role != "super_admin": return
             bot_state[chat_id] = {'type': 'add_session', 'pid': pid}
@@ -913,7 +888,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_add_session_name)
             return
 
-        # Update Excel
         if data == "menu_update_excel":
             if role not in ("admin", "super_admin"): return
             msg = bot.send_message(chat_id, "🔄 **آپدیت دیتابیس از روی اکسل:**\n\nلطفاً فایل اکسل تکمیل‌شده این پروژه را ارسال نمایید:",
@@ -921,14 +895,12 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_update_excel_file, pid)
             return
 
-        # Search
         if data == "menu_search":
             msg = bot.send_message(chat_id, "🔍 بخشی از نام، فامیل، شماره تماس، بخش یا عنوان کارت نیرو را ارسال فرمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu")))
             bot.register_next_step_handler(msg, process_search, pid, sid)
             return
 
-        # Units
         if data == "menu_units":
             chart = project_manager.get_project_org_chart(pid)
             if not chart:
@@ -950,13 +922,11 @@ def handle_callbacks(call):
             render_unit_page(chat_id, pid, sid, selected_unit, page, call.message.message_id)
             return
 
-        # Staff profile
         if data.startswith("user_"):
             staff_id = int(data.split("_")[1])
             show_user_profile(chat_id, pid, sid, staff_id, call.message.message_id)
             return
 
-        # Actions: status / card
         if data.startswith("act_"):
             parts = data.split("_")
             action_type = parts[1]
@@ -983,7 +953,6 @@ def handle_callbacks(call):
             show_user_profile(chat_id, pid, sid, staff_id, call.message.message_id)
             return
 
-        # Track late
         if data.startswith("tracklate_"):
             staff_id = int(data.split("_")[1])
             bot_state[chat_id] = {'type': 'track_late', 'staff_id': staff_id, 'pid': pid, 'sid': sid}
@@ -992,7 +961,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_track_late)
             return
 
-        # Edit desc
         if data.startswith("editdesc_"):
             staff_id = int(data.split("_")[1])
             bot_state[chat_id] = {'type': 'edit_desc', 'staff_id': staff_id, 'pid': pid, 'sid': sid}
@@ -1001,7 +969,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_edit_desc)
             return
 
-        # Latecomers list
         if data.startswith("menu_late_page_"):
             page = int(data.split("_")[3])
             latecomers = attendance_manager.get_latecomers(pid, sid)
@@ -1027,7 +994,6 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # Dashboard
         if data == "menu_dashboard":
             if role not in ("admin", "super_admin"): return
             stats = report_manager.get_dashboard_stats(pid, sid)
@@ -1049,7 +1015,6 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # Staff performance
         if data == "menu_staff_performance":
             if role not in ("admin", "super_admin"): return
             logs = report_manager.get_staff_performance_report(pid)
@@ -1069,7 +1034,6 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # Add staff member
         if data == "menu_add_user":
             bot_state[chat_id] = {'type': 'add_staff', 'pid': pid, 'sid': sid}
             msg = bot.send_message(chat_id, "➕ **افزودن نیروی جدید به پروژه**\n\n**مرحله ۱:** نام و نام خانوادگی نیرو را وارد فرمایید:",
@@ -1105,7 +1069,6 @@ def handle_callbacks(call):
             finalize_add_staff(chat_id, gen)
             return
 
-# --- Unit Head Operations ---
         if data == "menu_unit_head_shortage":
             role_chk, _, _, _, assigned_u = permission_manager.get_user_project_role(pid, chat_id)
             if role_chk != "unit_head" or not assigned_u:
@@ -1157,7 +1120,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_uh_shortage_desc)
             return
 
-        # View Unit Staff
         if data == "menu_unit_head_staff":
             role_chk, _, _, _, assigned_u = permission_manager.get_user_project_role(pid, chat_id)
             if role_chk != "unit_head" or not assigned_u: return
@@ -1175,7 +1137,6 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # View Unit Attendance in Active Session
         if data == "menu_unit_head_attendance":
             role_chk, _, _, _, assigned_u = permission_manager.get_user_project_role(pid, chat_id)
             if role_chk != "unit_head" or not assigned_u: return
@@ -1196,7 +1157,6 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # --- Admin Approval for Unit Head Shortage ---
         if data.startswith("appr_uh_shrt_"):
             if role not in ("admin", "super_admin") and not is_global: return
             parts = data.split("_")
@@ -1210,7 +1170,6 @@ def handle_callbacks(call):
             shortage_manager.approve_unit_head_shortage(sh_id)
             bot.answer_callback_query(call.id, "درخواست کمبود تایید و برودکست شد ✅", show_alert=True)
 
-            # Broadcast to eligible project members
             proj = project_manager.get_project(sh['project_id'])
             pname = proj['name'] if proj else ""
             grp = sh.get('target_group', 'عمومی')
@@ -1224,7 +1183,6 @@ def handle_callbacks(call):
             )
             members = permission_manager.get_project_members(sh['project_id'])
             for m in members:
-                # Strictly exclude unit heads from shortage broadcast announcements
                 if m['is_active'] and m['role'] != 'unit_head' and (m['role'] in ('admin', 'super_admin') or (grp == 'عمومی' or m['project_gender'] == grp)):
                     try:
                         bot.send_message(m['user_id'], broadcast_msg, parse_mode="Markdown")
@@ -1269,7 +1227,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_admin_edit_uh_count, sh_id, uh_id)
             return
 
-        # Shortages
         if data == "menu_view_shortages":
             shortages = shortage_manager.get_all_unresolved_shortages(pid)
             markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1281,7 +1238,7 @@ def handle_callbacks(call):
                     sid_sh = sh['id']
                     st = sh['status']
                     if st == 'تامین نشده':
-                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 جنسیت: {sh['target_group']}\n📝 توضیحات: {sh['description']}\n〰️〰️〰️〰️\n"
+                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 جنسیت: {sh['target_group']}\n📝 توضیحات: {sh['description']}\n〰️〰️️〰️〰️\n"
                         markup.add(types.InlineKeyboardButton(f"🙋🏻‍♂️ معرفی نیرو: {sh['unit']} - {sh['section']}", callback_data=f"suggestshrt_{sid_sh}"))
                     elif st == 'در انتظار تایید ادمین':
                         text += f"📢 **درخواست کمبود مسئول واحد (در انتظار بررسی):**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{sh['count']} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰️〰️〰️〰️\n"
@@ -1329,7 +1286,6 @@ def handle_callbacks(call):
             handle_callbacks(call)
             return
 
-        # Super admin shortage creation
         if data == "menu_shortage":
             if role != "super_admin": return
             chart = project_manager.get_project_org_chart(pid)
@@ -1363,7 +1319,6 @@ def handle_callbacks(call):
                 bot.send_message(chat_id, f"✅ کمبود {count_val} نفر در واحد **{st['unit']}** با موفقیت ثبت و برودکست شد.",
                                  reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")), parse_mode="Markdown")
 
-                # Broadcast exactly ONE message to eligible project members
                 proj = project_manager.get_project(st['pid'])
                 pname = proj['name'] if proj else ""
                 broadcast_msg = (
@@ -1376,7 +1331,6 @@ def handle_callbacks(call):
                 )
                 members = permission_manager.get_project_members(st['pid'])
                 for m in members:
-                    # Strictly exclude unit heads from shortage broadcast announcements
                     if m['is_active'] and m['role'] != 'unit_head' and (m['role'] in ('admin', 'super_admin') or (grp == 'عمومی' or m['project_gender'] == grp)):
                         try:
                             bot.send_message(m['user_id'], broadcast_msg, parse_mode="Markdown")
@@ -1386,7 +1340,6 @@ def handle_callbacks(call):
                 del bot_state[chat_id]
             return
 
-        # Group shift
         if data == "menu_group_shift":
             if role != "super_admin": return
             chart = project_manager.get_project_org_chart(pid)
@@ -1415,8 +1368,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_group_shift_time)
             return
 
-        # Project Permissions / Members Management (کادر اجرایی پروژه)
-        
         if data == "proj_add_uh_prompt":
             if role != "super_admin" and not is_global: return
             bot_state[chat_id] = {'type': 'add_project_uh', 'pid': pid}
@@ -1475,7 +1426,6 @@ def handle_callbacks(call):
             bot.edit_message_text(f"🔑 **کادر اجرایی پروژه «{pname}»:**\nجهت تغییر نقش یا حذف هر نیرو روی نام او کلیک فرمایید:", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        # Add existing HR member to this project with 1 click
         if data == "proj_add_from_hr":
             if role != "super_admin" and not is_global: return
             avail_members = permission_manager.get_available_hr_members_for_project(pid)
@@ -1537,7 +1487,6 @@ def handle_callbacks(call):
             handle_callbacks(call)
             return
 
-        # Edit existing member inside project
         if data.startswith("proj_editmember_") or data.startswith("perm_edit_"):
             if role != "super_admin" and not is_global: return
             prefix = "proj_editmember_" if data.startswith("proj_editmember_") else "perm_edit_"
@@ -1573,7 +1522,6 @@ def handle_callbacks(call):
             handle_callbacks(call)
             return
 
-        
         if data.startswith("guser_gen_"):
             gen = data.replace("guser_gen_", "")
             st = bot_state.get(chat_id)
@@ -1649,7 +1597,6 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_perm_new_user)
             return
 
-        # Excel download
         if data == "download_excel":
             if role not in ("admin", "super_admin"): return
             bot.send_message(chat_id, "⏳ در حال استخراج آخرین اطلاعات در فایل اکسل...")
@@ -1664,7 +1611,6 @@ def handle_callbacks(call):
                 bot.send_message(chat_id, "❌ خطا در تولید خروجی اکسل.")
             return
 
-        # Unhandled callback fallback
         logger.warning(f"⚠️ Unhandled callback received: '{data}' from User {chat_id}")
         if TELEBOT_AVAILABLE and bot:
             bot.answer_callback_query(call.id, "دستور نامشخص یا منقضی‌شده", show_alert=False)
@@ -1675,9 +1621,6 @@ def handle_callbacks(call):
             try: bot.answer_callback_query(call.id, "خطا در پردازش عملیات", show_alert=True)
             except Exception: pass
 
-# ==========================================
-# Wizard Step Handlers
-# ==========================================
 def process_wiz_project_name(message):
     chat_id = message.chat.id
     name = message.text.strip()
@@ -1699,7 +1642,8 @@ def process_wiz_class_time(message):
     if chat_id not in bot_state: bot_state[chat_id] = {}
     ctime = message.text.strip()
     log_message(chat_id, ctime, "process_wiz_class_time")
-    if ":" not in ctime or len(ctime) > 5:
+    
+    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', ctime):
         msg = bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً دقیقاً مانند `16:00` یا `08:30` ارسال فرمایید:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, process_wiz_class_time)
         return
@@ -1753,7 +1697,7 @@ def process_wiz_end_date_text(message):
     txt = message.text.strip()
     log_message(chat_id, txt, "process_wiz_end_date_text")
     bot_state[chat_id]['end_date'] = txt
-    bot_state[chat_id]['total_sessions'] = 2  # default multi-day estimate
+    bot_state[chat_id]['total_sessions'] = 2
     ask_wiz_prep_day(chat_id)
 
 def ask_wiz_prep_day(chat_id):
@@ -1845,9 +1789,6 @@ def process_global_add_user_name(message):
     )
     bot.send_message(chat_id, f"نیرو: **{name}**\n\n**مرحله ۳:** لطفاً **جنسیت** نیرو را مشخص فرمایید:\n_(تعیین‌کننده تفکیک دسترسی اپراتورها به لیست خواهران یا برادران)_", reply_markup=markup, parse_mode="Markdown")
 
-# ==========================================
-# Other Operational Step Handlers
-# ==========================================
 def show_user_profile(chat_id, project_id, session_id, staff_id, message_id=None):
     rec = attendance_manager.get_staff_session_attendance(project_id, session_id, staff_id)
     if not rec:
@@ -2095,7 +2036,6 @@ def finalize_add_staff(chat_id, gender):
     if not state or state.get('type') != 'add_staff': return
     pid = state['pid']; sid = state['sid']
     staff_id = staff_manager.add_staff_member(pid, state['name'], state['phone'], state['unit'], state['section'], gender=gender, notes="حین پروژه اضافه شده")
-    # Immediately add newly created staff to active session attendance roster
     attendance_manager.add_staff_to_session_roster(pid, sid, [staff_id])
     attendance_manager.update_attendance_status(pid, sid, staff_id, "حاضر")
     log_action(chat_id, pid, "Add Staff", f"Name: {state['name']}, Unit: {state['unit']}, Sec: {state['section']}")
@@ -2198,7 +2138,8 @@ def process_group_shift_time(message):
     if not state or state.get('type') != 'group_shift': return
     new_time = message.text.strip()
     log_message(chat_id, new_time, "process_group_shift_time")
-    if ":" not in new_time or len(new_time) > 5:
+    
+    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', new_time):
         msg = bot.send_message(chat_id, "❌ فرمت ساعت اشتباه است. لطفاً مانند `08:30` ارسال فرمایید:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, process_group_shift_time)
         return
@@ -2296,7 +2237,6 @@ def process_update_excel_file(message, project_id):
         log_error(chat_id, f"Error processing excel upload: {e}", e)
         bot.send_message(chat_id, f"❌ خطا در پردازش فایل: {e}\n(تراکنش لغو شد و اطلاعات قبلی دست‌نخورده باقی ماند)")
 
-# Register handlers
 if TELEBOT_AVAILABLE and bot:
     bot.message_handler(commands=['start'])(send_welcome)
     bot.callback_query_handler(func=lambda call: True)(handle_callbacks)
@@ -2322,9 +2262,6 @@ def start_bot():
         logger.exception(f"Fatal Bot Error: {e}")
         print(f"❌ خطای ربات: {e}")
 
-# Main moved to EOF
-
-
 def process_edit_project_name(message, project_id):
     chat_id = message.chat.id
     val = message.text.strip()
@@ -2342,7 +2279,6 @@ def process_edit_project_desc(message, project_id):
     log_action(chat_id, project_id, "Edit Project Description", f"Desc: {val}")
     bot.send_message(chat_id, "✅ توضیحات پروژه با موفقیت ذخیره شد.",
                      reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("⚙️ مدیریت پروژه", callback_data="menu_manage_project")))
-
 
 def process_uh_manual_section(message):
     chat_id = message.chat.id
@@ -2393,7 +2329,6 @@ def process_uh_shortage_desc(message):
     bot.send_message(chat_id, f"✅ درخواست کمبود **{count_val} نفر** در واحد **{unit}** (بخش {section}) ثبت گردید و جهت بررسی و تایید به مدیران پروژه ارسال شد.",
                      reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")), parse_mode="Markdown")
 
-    # Send Notification to Project Admins
     proj = project_manager.get_project(pid)
     pname = proj['name'] if proj else ""
     user = permission_manager.get_user(chat_id)
@@ -2414,18 +2349,14 @@ def process_uh_shortage_desc(message):
         types.InlineKeyboardButton("✏️ اصلاح تعداد", callback_data=f"edit_uh_count_{sh_id}_{chat_id}"),
         types.InlineKeyboardButton("❌ رد درخواست", callback_data=f"rej_uh_shrt_{sh_id}_{chat_id}")
     )
-    # Fetch ALL project managers, project leads, and global super admins
     admins = permission_manager.get_project_admins(pid, include_global=True)
-    logger.info(f"Broadcasting unit head shortage {sh_id} to {len(admins)} project managers/leads: {[a['user_id'] for a in admins]}")
     for a in admins:
-        # Never notify unit heads
         if a.get('role') == 'unit_head' or a['user_id'] == chat_id:
             continue
         try:
             bot.send_message(a['user_id'], admin_msg, reply_markup=admin_markup, parse_mode="Markdown")
-            logger.info(f"✅ Notified project lead/admin {a['user_id']} ({a.get('staff_name')}) of shortage {sh_id}")
         except Exception as ex:
-            logger.warning(f"Failed to send shortage notification to admin {a['user_id']}: {ex}")
+            pass
 
     del bot_state[chat_id]
 
@@ -2445,7 +2376,6 @@ def process_admin_edit_uh_count(message, shortage_id, uh_id):
     sh = shortage_manager.get_shortage(shortage_id)
     bot.send_message(chat_id, f"✅ تعداد به **{new_count} نفر** اصلاح گردید و پیام فراخوان کمبود برای کادر برودکست شد.", parse_mode="Markdown")
 
-    # Broadcast
     if sh:
         proj = project_manager.get_project(sh['project_id'])
         pname = proj['name'] if proj else ""
@@ -2460,7 +2390,6 @@ def process_admin_edit_uh_count(message, shortage_id, uh_id):
         )
         members = permission_manager.get_project_members(sh['project_id'])
         for m in members:
-            # Strictly exclude unit heads from shortage broadcast announcements
             if m['is_active'] and m['role'] != 'unit_head' and (m['role'] in ('admin', 'super_admin') or (grp == 'عمومی' or m['project_gender'] == grp)):
                 try:
                     bot.send_message(m['user_id'], broadcast_msg, parse_mode="Markdown")
@@ -2471,10 +2400,6 @@ def process_admin_edit_uh_count(message, shortage_id, uh_id):
                 bot.send_message(uh_id, f"🎉 درخواست کمبود نیروی شما برای واحد **{sh['unit']}** (بخش {sh['section']}) پس از اصلاح تعداد به **{new_count} نفر** توسط مدیر پروژه تایید شد و برای کادر ارسال گردید.", parse_mode="Markdown")
             except Exception: pass
 
-
-# ------------------------------------------------------------------
-# Project-Level Unit Head Management (مسئولین واحد با دسترسی محدود)
-# ------------------------------------------------------------------
 def process_proj_add_uh_uid(message):
     chat_id = message.chat.id
     state = bot_state.get(chat_id)
@@ -2527,12 +2452,9 @@ def ask_proj_uh_unit(chat_id, pid, staff_name):
     markup.add(types.InlineKeyboardButton("🔙 بازگشت به دسترسی‌ها", callback_data="menu_permissions"))
     bot.send_message(chat_id, f"مسئول واحد: **{staff_name}**\n\nمسئولیت کدام واحد این پروژه به ایشان سپرده شود؟", reply_markup=markup, parse_mode="Markdown")
 
-
-# ==================================================================
-# Entry Point - Must strictly be the last lines of bot.py
-# ==================================================================
 if __name__ == '__main__':
     logger.info("==================================================================")
     logger.info("🚀 ATTENDANCE BOT V2 - RUNNING POLLING WITH FULL SCOPES")
     logger.info("==================================================================")
     start_bot()
+    

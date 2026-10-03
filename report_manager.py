@@ -183,33 +183,33 @@ class ReportManager:
 
     def log_staff_action(self, project_id, user_id, action_type):
         today = datetime.now().strftime("%Y-%m-%d")
-        now_iso = datetime.now().isoformat()
-        conn = self.db.get_sqlite_connection()
+        now_iso = datetime.now()
+        conn = self.db.get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
             INSERT INTO staff_logs (project_id, user_id, action_type, log_date, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """, (project_id, user_id, action_type, today, now_iso))
             conn.commit()
         except Exception:
-            pass
+            conn.rollback()
         finally:
             conn.close()
 
     def get_staff_performance_report(self, project_id=None, date_str=None):
         target_date = date_str or datetime.now().strftime("%Y-%m-%d")
-        conn = self.db.get_sqlite_connection()
+        conn = self.db.get_connection()
         cursor = conn.cursor()
         query = """
         SELECT l.user_id, l.action_type, COUNT(*) as cnt, u.staff_name
         FROM staff_logs l
         LEFT JOIN users u ON l.user_id = u.user_id
-        WHERE l.log_date = ?
+        WHERE l.log_date = %s
         """
         params = [target_date]
         if project_id:
-            query += " AND l.project_id = ?"
+            query += " AND l.project_id = %s"
             params.append(project_id)
         query += " GROUP BY l.user_id, l.action_type, u.staff_name"
         cursor.execute(query, params)

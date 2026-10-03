@@ -19,7 +19,6 @@ class _DirectFinder(importlib.abc.MetaPathFinder):
 if not any(isinstance(f, _DirectFinder) for f in sys.meta_path):
     sys.meta_path.insert(0, _DirectFinder())
 
-# Load environment variables from .env file if available
 try:
     from dotenv import load_dotenv
     env_path = os.path.join(_root, ".env")
@@ -43,18 +42,16 @@ LOGS_DIR = os.path.join(BASE_PATH, "logs")
 for d in [DATA_DIR, PROJECT_FILES_DIR, DB_BACKUPS_DIR, EXCEL_BACKUPS_DIR, ARCHIVES_DIR, LOGS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-DEFAULT_SQLITE_PATH = os.getenv("SQLITE_PATH", os.path.join(DATA_DIR, "bot_cache.db"))
-
 BALE_API_URL = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot{0}/{1}")
 BALE_FILE_URL = os.getenv("BALE_FILE_URL", "https://tapi.bale.ai/file/bot{0}/{1}")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-MYSQL_ENABLED = os.getenv("MYSQL_ENABLED", "0") == "1"
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_USER = os.getenv("MYSQL_USER", "")
-MYSQL_PASS = os.getenv("MYSQL_PASS", "")
-MYSQL_DB = os.getenv("MYSQL_DB", "")
-MYSQL_TIMEOUT = int(os.getenv("MYSQL_TIMEOUT", "5"))
+# PostgreSQL Environment Variables Matching Host Setup
+PG_HOST = os.getenv("PostgreSQL_HOST", "bonyad.flowplanner.ir")
+PG_USER = os.getenv("PostgreSQL_USER", "flowpla2_fazele")
+PG_PASS = os.getenv("PostgreSQL_PASS", "270z7hIeEI[s)kF~")
+PG_DB = os.getenv("PostgreSQL_DB", "flowpla2_bale_bot")
+PG_PORT = int(os.getenv("PostgreSQL_PORT", "5432"))
 
 DEFAULT_SUPER_ADMINS = [1129742448, 541843838]
 super_admins_env = os.getenv("SUPER_ADMINS")

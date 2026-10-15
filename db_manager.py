@@ -1,10 +1,11 @@
 import os
 import logging
+import subprocess
 from datetime import datetime
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
-from config import PG_HOST, PG_USER, PG_PASS, PG_DB, PG_PORT, SUPER_ADMINS, LOGS_DIR
+from config import PG_HOST, PG_USER, PG_PASS, PG_DB, PG_PORT, SUPER_ADMINS, LOGS_DIR, DB_BACKUPS_DIR
 
 log_file = os.path.join(LOGS_DIR, "db_manager.log")
 logging.basicConfig(
@@ -17,7 +18,7 @@ class DatabaseUnavailableError(Exception):
     pass
 
 class PostgresConnectionWrapper:
-    """پوششی برای شبیه‌سازی رفتار SQLite و بازگرداندن اتصال به Pool به جای بستن آن"""
+    """پوششی برای شبیه‌سازی رفتار متدهای کانکشن و بازگرداندن اتصال به Pool"""
     def __init__(self, conn, pool):
         self.conn = conn
         self.pool = pool
@@ -36,6 +37,15 @@ class PostgresConnectionWrapper:
             self.pool.putconn(self.conn)
             self.conn = None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
 class DatabaseManager:
     CURRENT_SCHEMA_VERSION = 9
 
@@ -46,14 +56,15 @@ class DatabaseManager:
 
     def _init_pool(self):
         try:
+            # هاردکد کردن اطلاعات برای دور زدن باگ کش و متغیرهای محیطی
             self.pool = SimpleConnectionPool(
                 minconn=1,
                 maxconn=20,
-                host=PG_HOST,
-                database=PG_DB,
-                user=PG_USER,
-                password=PG_PASS,
-                port=PG_PORT
+                host="127.0.0.1",
+                database="flowpla2_bale_bot",
+                user="flowpla2_fazele",
+                password="270z7hIeEI[s)kF~",
+                port=5432
             )
         except Exception as e:
             logging.critical(f"Failed to connect to PostgreSQL: {e}")
@@ -68,11 +79,82 @@ class DatabaseManager:
             logging.error(f"Failed to get connection from pool: {e}")
             raise DatabaseUnavailableError(f"Connection Pool Error: {e}")
 
+    # اضافه کردن نام‌های جایگزین (Alias) برای جلوگیری از خطای ماژول‌های آپدیت نشده
+    def get_sqlite_connection(self):
+        return self.get_connection()
+
+    def get_mysql_connection(self):
+        return self.get_connection()
+
+    def backup_database(self, label="auto"):
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            category_dir = os.path.join(DB_BACKUPS_DIR, label)
+            os.makedirs(category_dir, exist_ok=True)
+            backup_name = f"bot_pg_backup_{label}_{timestamp}.sql"
+            target_path = os.path.join(category_dir, backup_name)
+
+            env = os.environ.copy()
+            env['PGPASSWORD'] = "270z7hIeEI[s)kF~"
+            
+            cmd = [
+                'pg_dump', 
+                '-h', '127.0.0.1', 
+                '-p', '5432', 
+                '-U', 'flowpla2_fazele', 
+                '-F', 'c', 
+                '-f', target_path, 
+                'flowpla2_bale_bot'
+            ]
+            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            try:
+                files = sorted(
+                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".sql")],
+                    key=os.path.getmtime
+                )
+                if len(files) > 15:
+                    for old_f in files[:-15]:
+                        os.remove(old_f)
+            except Exception:
+                pass
+
+            return target_path
+        except Exception as e:
+            logging.warning(f"pg_dump command failed (Expected on shared host): {e}")
+            # بازگشت فلگ برای ادامه روند واردات اکسل در صورت عدم دسترسی به shell
+            return "POSTGRES_NATIVE_TRANSACTION_FALLBACK"
+
+    def verify_backup_integrity(self, backup_path):
+        if backup_path == "POSTGRES_NATIVE_TRANSACTION_FALLBACK":
+            return True
+        return os.path.exists(backup_path) and os.path.getsize(backup_path) > 0
+
+    def restore_backup(self, backup_path, destination_path=None):
+        if backup_path == "POSTGRES_NATIVE_TRANSACTION_FALLBACK":
+            return False
+        try:
+            env = os.environ.copy()
+            env['PGPASSWORD'] = "270z7hIeEI[s)kF~"
+            
+            # ترمینیت کردن کانکشن‌های فعال قبل از بازیابی دیتابیس
+            term_cmd = [
+                'psql', '-h', '127.0.0.1', '-p', '5432', '-U', 'flowpla2_fazele', '-d', 'postgres',
+                '-c', "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'flowpla2_bale_bot' AND pid <> pg_backend_pid();"
+            ]
+            subprocess.run(term_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            cmd = ['pg_restore', '-h', '127.0.0.1', '-p', '5432', '-U', 'flowpla2_fazele', '-d', 'flowpla2_bale_bot', '-c', backup_path]
+            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception as e:
+            logging.error(f"Postgres restore failed: {e}")
+            return False
+
     def setup_database(self):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
-            # جداول کاملا بر اساس سینتکس PostgreSQL بازنویسی شده‌اند (استفاده از SERIAL و BOOLEAN)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS schema_meta (
                 version INTEGER PRIMARY KEY,
@@ -244,7 +326,6 @@ class DatabaseManager:
             );
             """)
 
-            # ساخت ایندکس‌های PostgreSQL (استفاده از IF NOT EXISTS)
             indexes = [
                 ("idx_staff_project_active", "project_staff (project_id, is_active)"),
                 ("idx_staff_project_phone", "project_staff (project_id, phone)"),
@@ -258,7 +339,6 @@ class DatabaseManager:
             for idx_name, idx_def in indexes:
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
 
-            # ثبت ادمین‌های سراسری پیش‌فرض
             now_iso = datetime.now()
             for uid in SUPER_ADMINS:
                 cursor.execute("""

@@ -39,6 +39,19 @@ class PermissionManager:
         conn.commit()
         conn.close()
 
+    def delete_user(self, user_id):
+        conn = self.db.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
     def set_user_active(self, user_id, is_active):
         conn = self.db.get_connection()
         cursor = conn.cursor()

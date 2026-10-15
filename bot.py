@@ -178,10 +178,16 @@ def send_welcome(message):
     if TELEBOT_AVAILABLE and bot: bot.clear_step_handler_by_chat_id(chat_id)
 
     user = permission_manager.get_user(chat_id)
+    
     if not user:
-        permission_manager.upsert_user(chat_id, f"کاربر {chat_id}", "خانم")
-        user = permission_manager.get_user(chat_id)
-        logger.info(f"Registered new guest user: {chat_id}")
+        logger.info(f"Unregistered user attempted access: {chat_id}")
+        if TELEBOT_AVAILABLE and bot:
+            bot.send_message(
+                chat_id, 
+                f"⛔️ شما در سامانه مدیریت کادر ثبت نشده‌اید.\n\nلطفاً شناسه زیر را کپی کرده و برای مدیر سیستم ارسال کنید تا دسترسی شما ایجاد شود:\n`{chat_id}`", 
+                parse_mode="Markdown"
+            )
+        return
 
     if not user.get('is_active', 1):
         logger.warning(f"Inactive user attempted access: {chat_id}")
@@ -444,6 +450,11 @@ def handle_callbacks(call):
             else:
                 markup.add(types.InlineKeyboardButton("👑 ارتقا به مدیر ارشد امور کادر", callback_data=f"guser_setg_{t_uid}_1"))
 
+            markup.add(
+                types.InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"guser_rename_{t_uid}"),
+                types.InlineKeyboardButton("🗑 حذف کامل نیرو", callback_data=f"guser_del_{t_uid}")
+            )
+
             act_txt = "🔴 غیرفعال کردن موقت در سیستم" if is_act else "🟢 فعال کردن حساب"
             act_val = "0" if is_act else "1"
             markup.add(
@@ -451,6 +462,32 @@ def handle_callbacks(call):
                 types.InlineKeyboardButton("🔙 بازگشت به لیست اعضا", callback_data="menu_hr_members")
             )
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            return
+
+        if data.startswith("guser_rename_"):
+            t_uid = int(data.replace("guser_rename_", ""))
+            msg = bot.send_message(chat_id, "✏️ لطفاً **نام و نام خانوادگی جدید** کاربر را ارسال فرمایید:", parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_guser_rename, t_uid)
+            return
+
+        if data.startswith("guser_del_"):
+            t_uid = int(data.replace("guser_del_", ""))
+            t_user = permission_manager.get_user(t_uid)
+            uname = t_user['staff_name'] if t_user else f"کاربر {t_uid}"
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("❌ بله، کاربر کاملاً حذف شود", callback_data=f"guser_confirmdel_{t_uid}"),
+                types.InlineKeyboardButton("🔙 انصراف", callback_data=f"hr_view_{t_uid}")
+            )
+            bot.edit_message_text(f"⚠️ **هشدار:** آیا از حذف کامل «{uname}» از کل پایگاه داده اطمینان دارید؟\nاین عملیات غیرقابل بازگشت است و کاربر از تمام پروژه‌ها حذف خواهد شد.", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            return
+
+        if data.startswith("guser_confirmdel_"):
+            t_uid = int(data.replace("guser_confirmdel_", ""))
+            permission_manager.delete_user(t_uid)
+            bot.answer_callback_query(call.id, "کاربر با موفقیت از کل سیستم حذف شد ✅", show_alert=True)
+            call.data = "menu_hr_members"
+            handle_callbacks(call)
             return
 
         if data.startswith("hr_assignproj_") or data.startswith("guser_assignproj_"):
@@ -746,7 +783,7 @@ def handle_callbacks(call):
         if data.startswith("editproj_name_"):
             if role != "super_admin" and not is_global: return
             target_pid = int(data.replace("editproj_name_", ""))
-            msg = bot.send_message(chat_id, "✏️ لطفاً **نام جدید پروژه** را ارسال فرمایید:",
+            msg = bot.send_message(chat_id, "✏️️ لطفاً **نام جدید پروژه** را ارسال فرمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")), parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_edit_project_name, target_pid)
             return
@@ -763,12 +800,28 @@ def handle_callbacks(call):
             if role not in ("admin", "super_admin"): return
             rep_text = report_manager.generate_class_text_report(pid, sid)
             markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
-            if len(rep_text) > 4000:
-                for chunk in [rep_text[i:i+3800] for i in range(0, len(rep_text), 3800)]:
-                    bot.send_message(chat_id, chunk)
+            
+            # در پیام‌رسان بله، متون طولانی فارسی باعث خطای 414 Nginx می‌شوند.
+            # متن را خط به خط و با محدودیت امن ۱۵۰۰ کاراکتر می‌‌شکنیم تا مارک‌داون‌ها خراب نشوند.
+            SAFE_LIMIT = 1500
+            if len(rep_text) > SAFE_LIMIT:
+                lines = rep_text.split('\n')
+                chunk = ""
+                for line in lines:
+                    # اگر خط فعلی را اضافه کنیم و از محدودیت رد شود، چانک فعلی را می‌فرستیم
+                    if len(chunk) + len(line) + 1 > SAFE_LIMIT:
+                        bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
+                        chunk = line + "\n"
+                    else:
+                        chunk += line + "\n"
+                
+                # ارسال قسمت باقیمانده
+                if chunk.strip():
+                    bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
+                    
                 bot.send_message(chat_id, "✅ گزارش کادر و حضور جلسه فعال ارسال گردید.", reply_markup=markup)
             else:
-                bot.send_message(chat_id, rep_text, reply_markup=markup)
+                bot.send_message(chat_id, rep_text, reply_markup=markup, parse_mode="Markdown")
             return
 
         if data.startswith("apprshrt_"):
@@ -1238,10 +1291,10 @@ def handle_callbacks(call):
                     sid_sh = sh['id']
                     st = sh['status']
                     if st == 'تامین نشده':
-                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 جنسیت: {sh['target_group']}\n📝 توضیحات: {sh['description']}\n〰️〰️️〰️〰️\n"
+                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 جنسیت: {sh['target_group']}\n📝 توضیحات: {sh['description']}\n〰️〰️〰〰️\n"
                         markup.add(types.InlineKeyboardButton(f"🙋🏻‍♂️ معرفی نیرو: {sh['unit']} - {sh['section']}", callback_data=f"suggestshrt_{sid_sh}"))
                     elif st == 'در انتظار تایید ادمین':
-                        text += f"📢 **درخواست کمبود مسئول واحد (در انتظار بررسی):**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{sh['count']} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰️〰️〰️〰️\n"
+                        text += f"📢 **درخواست کمبود مسئول واحد (در انتظار بررسی):**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{sh['count']} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰〰️〰️〰️\n"
                         if role in ('admin', 'super_admin') or is_global:
                             req_by = sh.get('requested_by') or 0
                             markup.add(
@@ -1249,7 +1302,7 @@ def handle_callbacks(call):
                                 types.InlineKeyboardButton(f"❌ رد: {sh['unit']}", callback_data=f"rej_uh_shrt_{sid_sh}_{req_by}")
                             )
                     elif st == 'در انتظار تایید':
-                        text += f"⏳ **در انتظار تایید ادمین:**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👤 نیروی پیشنهادی: {sh.get('assigned_name', '')} ({sh.get('phone', '')})\n〰️〰️〰️〰️\n"
+                        text += f"⏳ **در انتظار تایید ادمین:**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👤 نیروی پیشنهادی: {sh.get('assigned_name', '')} ({sh.get('phone', '')})\n〰️〰️〰️〰\n"
                         if role in ('admin', 'super_admin'):
                             markup.add(types.InlineKeyboardButton(f"✅ تایید پیشنهاد: {sh['unit']} - {sh['section']}", callback_data=f"approveshrt_{sid_sh}"))
                             markup.add(types.InlineKeyboardButton(f"❌ رد پیشنهاد: {sh['unit']} - {sh['section']}", callback_data=f"rejectshrt_{sid_sh}"))
@@ -1611,7 +1664,7 @@ def handle_callbacks(call):
                 bot.send_message(chat_id, "❌ خطا در تولید خروجی اکسل.")
             return
 
-        logger.warning(f"⚠️ Unhandled callback received: '{data}' from User {chat_id}")
+        logger.warning(f"⚠️️ Unhandled callback received: '{data}' from User {chat_id}")
         if TELEBOT_AVAILABLE and bot:
             bot.answer_callback_query(call.id, "دستور نامشخص یا منقضی‌شده", show_alert=False)
 
@@ -1620,6 +1673,16 @@ def handle_callbacks(call):
         if TELEBOT_AVAILABLE and bot:
             try: bot.answer_callback_query(call.id, "خطا در پردازش عملیات", show_alert=True)
             except Exception: pass
+
+def process_guser_rename(message, target_uid):
+    chat_id = message.chat.id
+    new_name = message.text.strip()
+    permission_manager.update_staff_name(target_uid, new_name)
+    bot.send_message(
+        chat_id, 
+        f"✅ نام کاربر با موفقیت به «{new_name}» تغییر یافت.",
+        reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت به پروفایل", callback_data=f"hr_view_{target_uid}"))
+    )
 
 def process_wiz_project_name(message):
     chat_id = message.chat.id
@@ -2206,7 +2269,7 @@ def process_update_excel_file(message, project_id):
     fname = message.document.file_name
     log_message(chat_id, f"Uploaded document: {fname}", "process_update_excel_file")
     if fname.lower().endswith('.xls') and not fname.lower().endswith('.xlsx'):
-        bot.send_message(chat_id, "⚠️ فرمت قدیمی `.xls` پشتیبانی نمی‌شود.\nلطفاً فایل را در نرم‌افزار اکسل با فرمت **.xlsx** ذخیره کرده و ارسال فرمایید.", parse_mode="Markdown")
+        bot.send_message(chat_id, "⚠️ فرمت قدیمی `.xls` پشتیبانی نمی‌شود.\nلطفاً فایل را در نرم‌‌افزار اکسل با فرمت **.xlsx** ذخیره کرده و ارسال فرمایید.", parse_mode="Markdown")
         return
     if not fname.lower().endswith('.xlsx'):
         bot.send_message(chat_id, "❌ فقط فایل‌های با فرمت .xlsx مجاز هستند.")
@@ -2262,199 +2325,8 @@ def start_bot():
         logger.exception(f"Fatal Bot Error: {e}")
         print(f"❌ خطای ربات: {e}")
 
-def process_edit_project_name(message, project_id):
-    chat_id = message.chat.id
-    val = message.text.strip()
-    log_message(chat_id, val, "process_edit_project_name")
-    project_manager.update_project_details(project_id, name=val)
-    log_action(chat_id, project_id, "Edit Project Name", f"New Name: {val}")
-    bot.send_message(chat_id, f"✅ نام پروژه با موفقیت به «{val}» تغییر یافت.",
-                     reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("⚙️ مدیریت پروژه", callback_data="menu_manage_project")))
-
-def process_edit_project_desc(message, project_id):
-    chat_id = message.chat.id
-    val = message.text.strip()
-    log_message(chat_id, val, "process_edit_project_desc")
-    project_manager.update_project_details(project_id, description=val)
-    log_action(chat_id, project_id, "Edit Project Description", f"Desc: {val}")
-    bot.send_message(chat_id, "✅ توضیحات پروژه با موفقیت ذخیره شد.",
-                     reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("⚙️ مدیریت پروژه", callback_data="menu_manage_project")))
-
-def process_uh_manual_section(message):
-    chat_id = message.chat.id
-    state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'uh_shortage': return
-    sec = message.text.strip()
-    log_message(chat_id, sec, "process_uh_manual_section")
-    state['section'] = sec
-    msg = bot.send_message(chat_id, f"🗂 بخش: **{sec}**\n\nتعداد نیروی مورد نیاز را وارد فرمایید (مثلاً: `2`):", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, process_uh_shortage_count)
-
-def process_uh_shortage_count(message):
-    chat_id = message.chat.id
-    state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'uh_shortage': return
-    txt = message.text.strip()
-    log_message(chat_id, txt, "process_uh_shortage_count")
-    from utils import normalize_persian
-    cnt = normalize_persian(txt)
-    if not cnt.isdigit() or int(cnt) <= 0:
-        msg = bot.send_message(chat_id, "❌ لطفاً فقط یک عدد معتبر (مثلاً `2`) وارد فرمایید:")
-        bot.register_next_step_handler(msg, process_uh_shortage_count)
-        return
-    state['count'] = int(cnt)
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    markup.add(
-        types.InlineKeyboardButton("👩🏻 خانم", callback_data="uh_grp_خانم"),
-        types.InlineKeyboardButton("👨🏻 آقا", callback_data="uh_grp_آقا"),
-        types.InlineKeyboardButton("👥 فرقی ندارد", callback_data="uh_grp_عمومی")
-    )
-    bot.send_message(chat_id, f"تعداد: **{cnt} نفر**\n\nلطفاً جنسیت مورد نیاز را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
-
-def process_uh_shortage_desc(message):
-    chat_id = message.chat.id
-    state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'uh_shortage': return
-    desc = message.text.strip()
-    log_message(chat_id, desc, "process_uh_shortage_desc")
-    pid = state['pid']
-    unit = state['unit']
-    section = state['section']
-    count_val = state['count']
-    target_grp = state['target_group']
-
-    sh_id = shortage_manager.add_unit_head_shortage(pid, unit, section, count_val, target_grp, desc, requested_by=chat_id)
-    log_action(chat_id, pid, "Unit Head Shortage Request", f"Unit: {unit}, Sec: {section}, Count: {count_val}")
-
-    bot.send_message(chat_id, f"✅ درخواست کمبود **{count_val} نفر** در واحد **{unit}** (بخش {section}) ثبت گردید و جهت بررسی و تایید به مدیران پروژه ارسال شد.",
-                     reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")), parse_mode="Markdown")
-
-    proj = project_manager.get_project(pid)
-    pname = proj['name'] if proj else ""
-    user = permission_manager.get_user(chat_id)
-    uh_name = user.get('staff_name') or f"کاربر {chat_id}"
-
-    admin_msg = (
-        f"🔔 **درخواست اعلام کمبود نیرو از طرف مسئول واحد**\n\n"
-        f"🏢 پروژه: **{pname}**\n"
-        f"👤 مسئول واحد: **{uh_name}** (واحد **{unit}**)\n"
-        f"🗂 بخش: **{section}**\n"
-        f"👥 تعداد درخواستی: **{count_val} نفر** ({target_grp})\n"
-        f"📝 توضیحات: {desc}\n\n"
-        f"جهت بررسی و تعیین وضعیت انتخاب فرمایید:"
-    )
-    admin_markup = types.InlineKeyboardMarkup(row_width=2)
-    admin_markup.add(
-        types.InlineKeyboardButton("✅ تایید و ارسال عمومی برای کادر", callback_data=f"appr_uh_shrt_{sh_id}_{chat_id}"),
-        types.InlineKeyboardButton("✏️ اصلاح تعداد", callback_data=f"edit_uh_count_{sh_id}_{chat_id}"),
-        types.InlineKeyboardButton("❌ رد درخواست", callback_data=f"rej_uh_shrt_{sh_id}_{chat_id}")
-    )
-    admins = permission_manager.get_project_admins(pid, include_global=True)
-    for a in admins:
-        if a.get('role') == 'unit_head' or a['user_id'] == chat_id:
-            continue
-        try:
-            bot.send_message(a['user_id'], admin_msg, reply_markup=admin_markup, parse_mode="Markdown")
-        except Exception as ex:
-            pass
-
-    del bot_state[chat_id]
-
-def process_admin_edit_uh_count(message, shortage_id, uh_id):
-    chat_id = message.chat.id
-    txt = message.text.strip()
-    from utils import normalize_persian
-    cnt = normalize_persian(txt)
-    if not cnt.isdigit() or int(cnt) <= 0:
-        msg = bot.send_message(chat_id, "❌ لطفاً فقط یک عدد معتبر وارد فرمایید:")
-        bot.register_next_step_handler(msg, process_admin_edit_uh_count, shortage_id, uh_id)
-        return
-
-    new_count = int(cnt)
-    shortage_manager.update_shortage_count(shortage_id, new_count)
-    shortage_manager.approve_unit_head_shortage(shortage_id)
-    sh = shortage_manager.get_shortage(shortage_id)
-    bot.send_message(chat_id, f"✅ تعداد به **{new_count} نفر** اصلاح گردید و پیام فراخوان کمبود برای کادر برودکست شد.", parse_mode="Markdown")
-
-    if sh:
-        proj = project_manager.get_project(sh['project_id'])
-        pname = proj['name'] if proj else ""
-        grp = sh.get('target_group', 'عمومی')
-        broadcast_msg = (
-            f"🔔 **اعلام کمبود نیرو - {pname}**\n\n"
-            f"🏢 واحد: **{sh['unit']}**\n"
-            f"🗂 بخش: **{sh['section']}**\n"
-            f"👥 تعداد: **{new_count} نفر** ({grp})\n"
-            f"📝 توضیحات: {sh.get('description') or 'ندارد'}\n\n"
-            f"لطفاً در صورت شناخت فرد مناسب، جهت تأمین کمبود از منوی ربات اقدام فرمایید."
-        )
-        members = permission_manager.get_project_members(sh['project_id'])
-        for m in members:
-            if m['is_active'] and m['role'] != 'unit_head' and (m['role'] in ('admin', 'super_admin') or (grp == 'عمومی' or m['project_gender'] == grp)):
-                try:
-                    bot.send_message(m['user_id'], broadcast_msg, parse_mode="Markdown")
-                except Exception: pass
-
-        if uh_id:
-            try:
-                bot.send_message(uh_id, f"🎉 درخواست کمبود نیروی شما برای واحد **{sh['unit']}** (بخش {sh['section']}) پس از اصلاح تعداد به **{new_count} نفر** توسط مدیر پروژه تایید شد و برای کادر ارسال گردید.", parse_mode="Markdown")
-            except Exception: pass
-
-def process_proj_add_uh_uid(message):
-    chat_id = message.chat.id
-    state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'add_project_uh': return
-    txt = message.text.strip()
-    log_message(chat_id, txt, "process_proj_add_uh_uid")
-    from utils import normalize_persian
-    norm_txt = normalize_persian(txt)
-    if not norm_txt.isdigit():
-        msg = bot.send_message(chat_id, "❌ لطفاً شناسه عددی (Chat ID) بله را به صورت رقم لاتین یا فارسی وارد فرمایید:")
-        bot.register_next_step_handler(msg, process_proj_add_uh_uid)
-        return
-
-    t_uid = int(norm_txt)
-    state['uid'] = t_uid
-    pid = state['pid']
-
-    t_user = permission_manager.get_user(t_uid)
-    if t_user:
-        state['staff_name'] = t_user.get('staff_name') or f"کاربر {t_uid}"
-        state['gender'] = t_user.get('gender', 'خانم')
-        ask_proj_uh_unit(chat_id, pid, state['staff_name'])
-    else:
-        msg = bot.send_message(chat_id, f"شناسه: `{t_uid}`\n\nلطفاً **نام و نام خانوادگی** مسئول واحد را ارسال فرمایید:", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, process_proj_add_uh_name)
-
-def process_proj_add_uh_name(message):
-    chat_id = message.chat.id
-    state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'add_project_uh': return
-    name = message.text.strip()
-    log_message(chat_id, name, "process_proj_add_uh_name")
-    state['staff_name'] = name
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("👩🏻 خانم", callback_data="proj_uh_gen_خانم"),
-        types.InlineKeyboardButton("👨🏻 آقا", callback_data="proj_uh_gen_آقا")
-    )
-    bot.send_message(chat_id, f"مسئول واحد: **{name}**\n\nلطفاً **جنسیت** ایشان را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
-
-def ask_proj_uh_unit(chat_id, pid, staff_name):
-    chart = project_manager.get_project_org_chart(pid)
-    units = sorted(list(chart.keys()))
-    if not units:
-        all_s = staff_manager.list_staff(pid)
-        units = sorted(list(set(s['unit'] for s in all_s if s.get('unit'))))
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for u in units:
-        markup.add(types.InlineKeyboardButton(f"🏢 {u}", callback_data=f"proj_uh_setunit_{u}"))
-    markup.add(types.InlineKeyboardButton("🔙 بازگشت به دسترسی‌ها", callback_data="menu_permissions"))
-    bot.send_message(chat_id, f"مسئول واحد: **{staff_name}**\n\nمسئولیت کدام واحد این پروژه به ایشان سپرده شود؟", reply_markup=markup, parse_mode="Markdown")
-
 if __name__ == '__main__':
     logger.info("==================================================================")
     logger.info("🚀 ATTENDANCE BOT V2 - RUNNING POLLING WITH FULL SCOPES")
     logger.info("==================================================================")
     start_bot()
-    

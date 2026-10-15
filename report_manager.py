@@ -13,11 +13,15 @@ class ClassReportDataBuilder:
 
         proj = project_manager.get_project(project_id)
         sess = attendance_manager.get_session(session_id)
-        all_att = attendance_manager.get_session_attendance(project_id, session_id)
+        all_att_raw = attendance_manager.get_session_attendance(project_id, session_id)
         org_chart = project_manager.get_project_org_chart(project_id)
+
+        # --- فیلتر طلایی: حذف نیروهای «بدون شیفت» فقط از گزارش متنی ---
+        all_att = [s for s in all_att_raw if "بدون شیفت" not in str(s.get('status', '')).strip()]
 
         proj_name = proj['name'] if proj else "کلاس"
         sess_date = sess.get('session_date') or datetime.now().strftime("%Y/%m/%d") if sess else ""
+        sess_day = sess.get('day_of_week') or "" if sess else ""
 
         # 1. Identify Senior / Arshad staff
         arshad_staff = None
@@ -29,27 +33,55 @@ class ClassReportDataBuilder:
                 arshad_staff = s
                 break
 
-        # 2. Group staff by unit and section
+        # 2. Group staff by unit, section, and hierarchy
         units_data = {}
         for s in all_att:
             if s == arshad_staff:
                 continue
-            u_raw = (s.get('unit') or 'سایر').strip()
-            sec_raw = (s.get('section') or 'عمومی').strip()
-            pos_raw = (s.get('position') or 'نیرو').strip()
+            
+            u_raw = str(s.get('unit') or '').strip()
+            if not u_raw or u_raw == 'None':
+                u_raw = 'عمومی'
+
+            sec_raw = str(s.get('section') or '').strip()
+            
+            # --- قانون: اگر اسم بخش و واحد یکی است یا بخش خالی است، بخش را حذف کن ---
+            if sec_raw in ['None', '', 'عمومی', 'اصلی', '-'] or sec_raw == u_raw:
+                sec_raw = ''
+
+            pos_raw = str(s.get('position') or '').strip()
 
             if u_raw not in units_data:
-                units_data[u_raw] = {'head': [], 'deputy': [], 'sections': {}, 'all_staff': []}
+                units_data[u_raw] = {'heads': [], 'deputies': [], 'sections': {}, 'general_staff': []}
 
-            if "مسئول واحد" in pos_raw or "مسئول" in pos_raw or "سرپرست" in pos_raw:
-                units_data[u_raw]['head'].append(s)
-            elif "جانشین" in pos_raw or "معاون" in pos_raw:
-                units_data[u_raw]['deputy'].append(s)
+            # Hierarchy Logic
+            if pos_raw in ["مسئول واحد", "مدیر", "مدیر واحد"]:
+                units_data[u_raw]['heads'].append(s)
+            elif pos_raw in ["جانشین", "معاون", "جانشین مسئول واحد", "جانشین واحد", "جانشین مسئول"]:
+                units_data[u_raw]['deputies'].append(s)
+            elif pos_raw in ["مسئول بخش", "سرپرست بخش", "سرپرست"]:
+                if sec_raw:
+                    if sec_raw not in units_data[u_raw]['sections']:
+                        units_data[u_raw]['sections'][sec_raw] = {'heads': [], 'staff': []}
+                    units_data[u_raw]['sections'][sec_raw]['heads'].append(s)
+                else:
+                    units_data[u_raw]['general_staff'].append(s)
+            elif pos_raw == "مسئول":
+                # تشخیص هوشمند مسئول واحد از مسئول بخش
+                if not sec_raw:
+                    units_data[u_raw]['heads'].append(s)
+                else:
+                    if sec_raw not in units_data[u_raw]['sections']:
+                        units_data[u_raw]['sections'][sec_raw] = {'heads': [], 'staff': []}
+                    units_data[u_raw]['sections'][sec_raw]['heads'].append(s)
             else:
-                if sec_raw not in units_data[u_raw]['sections']:
-                    units_data[u_raw]['sections'][sec_raw] = []
-                units_data[u_raw]['sections'][sec_raw].append(s)
-            units_data[u_raw]['all_staff'].append(s)
+                # Regular staff
+                if sec_raw:
+                    if sec_raw not in units_data[u_raw]['sections']:
+                        units_data[u_raw]['sections'][sec_raw] = {'heads': [], 'staff': []}
+                    units_data[u_raw]['sections'][sec_raw]['staff'].append(s)
+                else:
+                    units_data[u_raw]['general_staff'].append(s)
 
         # 3. Determine units order based on org_chart display_order
         ordered_units = list(org_chart.keys())
@@ -60,6 +92,7 @@ class ClassReportDataBuilder:
         return {
             'project_name': proj_name,
             'session_date': sess_date,
+            'session_day': sess_day,
             'arshad': arshad_staff,
             'ordered_units': ordered_units,
             'org_chart': org_chart,
@@ -67,11 +100,74 @@ class ClassReportDataBuilder:
         }
 
 class PersianClassReportRenderer:
-    """Renders validated class report data into the required Persian business format."""
+    """Renders validated class report data into the required Persian business format with emojis and Shamsi date."""
+    
+    @staticmethod
+    def to_persian_digits(text):
+        persian_digits = "۰۱۲۳۴۵۶۷۸۹"
+        english_digits = "0123456789"
+        translation_table = str.maketrans(english_digits, persian_digits)
+        return str(text).translate(translation_table)
+
+    @staticmethod
+    def gregorian_to_jalali(gy, gm, gd):
+        """Standard and precise Gregorian to Jalali (Shamsi) conversion."""
+        g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        gy -= 1600
+        gm -= 1
+        gd -= 1
+
+        g_day_no = 365 * gy + (gy + 3) // 4 - (gy + 99) // 100 + (gy + 399) // 400
+
+        for i in range(gm):
+            g_day_no += g_d_m[i + 1] - g_d_m[i]
+
+        if gm > 1 and ((gy % 4 == 0 and gy % 100 != 0) or (gy % 400 == 0)):
+            g_day_no += 1
+
+        g_day_no += gd
+        j_day_no = g_day_no - 79
+
+        j_np = j_day_no // 12053
+        j_day_no %= 12053
+
+        jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+        j_day_no %= 1461
+
+        if j_day_no >= 366:
+            jy += (j_day_no - 1) // 365
+            j_day_no = (j_day_no - 1) % 365
+
+        for i in range(11):
+            days_in_month = 31 if i < 6 else 30
+            if j_day_no < days_in_month:
+                jm = i + 1
+                jd = j_day_no + 1
+                break
+            j_day_no -= days_in_month
+        else:
+            jm = 12
+            jd = j_day_no + 1
+
+        return jy, jm, jd
+
+    @staticmethod
+    def convert_date(date_str):
+        try:
+            parts = date_str.replace('/', '-').split('-')
+            if len(parts) == 3:
+                jy, jm, jd = PersianClassReportRenderer.gregorian_to_jalali(int(parts[0]), int(parts[1]), int(parts[2]))
+                return f"{jy}/{jm:02d}/{jd:02d}"
+        except Exception:
+            pass
+        return date_str
+
     @staticmethod
     def render(report_data):
         proj_name = report_data['project_name']
-        sess_date = report_data['session_date']
+        raw_date = PersianClassReportRenderer.convert_date(report_data['session_date'])
+        sess_date = PersianClassReportRenderer.to_persian_digits(raw_date)
+        sess_day = report_data.get('session_day', '')
         arshad = report_data['arshad']
         ordered_units = report_data['ordered_units']
         org_chart = report_data['org_chart']
@@ -79,61 +175,111 @@ class PersianClassReportRenderer:
 
         def format_staff(s):
             name = s.get('name', '')
-            st = (s.get('status') or '').strip()
-            g_prefix = "آقا" if s.get('gender') == 'آقا' else "خانم"
-            status_part = f" ({st})" if st else ""
-            return f"{g_prefix} {name}{status_part}"
+            st = str(s.get('status', '')).strip()
+            
+            status_icon = "⚪️"
+            if "حاضر" in st:
+                status_icon = "✅"
+            elif "غایب" in st:
+                status_icon = "❌"
+            elif "تاخیر" in st:
+                status_icon = "⏱"
+            
+            return f"{status_icon} {name}"
 
         def format_staff_list(staff_list):
             if not staff_list:
                 return ""
-            return ", ".join([format_staff(s) for s in staff_list])
+            return "\n".join([f"  {format_staff(s)}" for s in staff_list])
 
-        lines = [f"{proj_name}", f"تاریخ: {sess_date}", ""]
+        # هدر اصلی گزارش
+        lines = [f"کلاس سطح: {proj_name}       روز: {sess_day}         تاریخ: {sess_date}\n"]
 
         if arshad:
-            g_prefix = "آقا" if arshad.get('gender') == 'آقا' else "خانم"
-            st_part = f" ({arshad['status']})" if arshad.get('status') else ""
-            lines.append(f"*ارشد:* {g_prefix} {arshad['name']}{st_part}")
-            lines.append(f"{arshad.get('phone', '')}")
+            lines.append(f"*ارشد:* {format_staff(arshad)}")
+            if arshad.get('phone'):
+                phone_fa = PersianClassReportRenderer.to_persian_digits(arshad.get('phone', ''))
+                lines.append(phone_fa)
         else:
-            lines.append("*ارشد:* خانم ")
+            lines.append("*ارشد:* ")
             lines.append("۰۹...")
         lines.append("")
 
+        dividers = ["🔹🔹🔹🔹🔹🔹🔹🔹🔹🔹", "🔸🔸🔸🔸🔸🔸🔸🔸🔸🔸"]
+        div_idx = 0
+
         for u_name in ordered_units:
+            # مدیریت واحدهایی که در چارت هستند اما نیرویی ندارند
             u_data = units_data.get(u_name)
-            head_str = format_staff_list(u_data['head']) if u_data and u_data['head'] else "خانم "
-            deputy_str = format_staff_list(u_data['deputy']) if u_data and u_data['deputy'] else ""
+            if not u_data and u_name in org_chart:
+                u_data = {'heads': [], 'deputies': [], 'sections': {}, 'general_staff': []}
+            
+            if not u_data: continue
+            
+            has_staff = bool(u_data.get('heads') or u_data.get('deputies') or u_data.get('general_staff'))
+            if not has_staff:
+                for sec_data in u_data.get('sections', {}).values():
+                    if sec_data.get('heads') or sec_data.get('staff'):
+                        has_staff = True
+                        break
+            
+            if not has_staff:
+                continue
+            # ----------------------------------------------------
 
-            lines.append(f"*واحد {u_name}:* {head_str}")
-            if deputy_str:
-                lines.append(f"جانشین مسئول واحد: {deputy_str}")
+            lines.append(dividers[div_idx])
+            div_idx = 1 - div_idx
             lines.append("")
-
+            
+            display_unit_name = u_name if "واحد" in u_name else f"واحد {u_name}"
+            head_str = ""
+            if u_data['heads']:
+                head_str = " ".join([format_staff(h) for h in u_data['heads']])
+            
+            lines.append(f"*{display_unit_name}:* {head_str}".strip())
+            
+            deputy_str = ""
+            if u_data['deputies']:
+                deputy_str = " ".join([format_staff(d) for d in u_data['deputies']])
+            
+            if deputy_str or u_data['deputies']:
+                lines.append(f"جانشین مسئول واحد: {deputy_str}".strip())
+            else:
+                lines.append("جانشین مسئول واحد:")
+            lines.append("")
+            
             sections_in_chart = org_chart.get(u_name, [])
             all_unit_sections = list(sections_in_chart)
-            if u_data:
-                for sec in u_data['sections'].keys():
-                    if sec not in all_unit_sections:
-                        all_unit_sections.append(sec)
+            for sec in u_data['sections'].keys():
+                if sec not in all_unit_sections:
+                    all_unit_sections.append(sec)
 
-            valid_secs = [sec for sec in all_unit_sections if sec and sec not in ('-', 'None', 'عمومی')]
+            valid_secs = [sec for sec in all_unit_sections if sec and sec not in ('-', 'None', 'عمومی', 'اصلی', u_name)]
 
             if valid_secs:
                 for sec in valid_secs:
-                    sec_staff = u_data['sections'].get(sec, []) if u_data else []
-                    lines.append(f"بخش {sec}:")
-                    lines.append(f"نیروها: {format_staff_list(sec_staff)}")
+                    sec_data = u_data['sections'].get(sec, {'heads': [], 'staff': []})
+                    
+                    sec_head_str = ""
+                    if sec_data['heads']:
+                        sec_head_str = " ".join([format_staff(sh) for sh in sec_data['heads']])
+                    
+                    if sec_head_str:
+                        lines.append(f"بخش {sec}:\nمسئول بخش: {sec_head_str}".strip())
+                    else:
+                        lines.append(f"بخش {sec}:".strip())
+                    
+                    lines.append("نیروها:")
+                    if sec_data['staff']:
+                        for st in sec_data['staff']:
+                            lines.append(f"  {format_staff(st)}")
                     lines.append("")
-            else:
-                unit_general_staff = []
-                if u_data:
-                    for s_list in u_data['sections'].values():
-                        unit_general_staff.extend(s_list)
-                if unit_general_staff:
-                    lines.append(f"نیروها: {format_staff_list(unit_general_staff)}")
-                    lines.append("")
+            
+            if u_data['general_staff']:
+                lines.append("نیرو:")
+                for st in u_data['general_staff']:
+                    lines.append(f"  {format_staff(st)}")
+                lines.append("")
 
         return "\n".join(lines).strip()
 
@@ -218,7 +364,6 @@ class ReportManager:
         return [dict(r) for r in rows]
 
     def generate_class_text_report(self, project_id, session_id):
-        """Pipeline: Report Data Builder -> Validated Report Data -> Persian Class Report Renderer."""
         report_data = ClassReportDataBuilder.build(project_id, session_id)
         return PersianClassReportRenderer.render(report_data)
 

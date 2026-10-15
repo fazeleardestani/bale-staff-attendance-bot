@@ -46,8 +46,8 @@ BALE_API_URL = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot{0}/{1}")
 BALE_FILE_URL = os.getenv("BALE_FILE_URL", "https://tapi.bale.ai/file/bot{0}/{1}")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# PostgreSQL Environment Variables Matching Host Setup
-PG_HOST = os.getenv("PostgreSQL_HOST", "bonyad.flowplanner.ir")
+# PostgreSQL Environment Variables - Changed default host to 127.0.0.1 for local connection
+PG_HOST = os.getenv("PostgreSQL_HOST", "127.0.0.1")
 PG_USER = os.getenv("PostgreSQL_USER", "flowpla2_fazele")
 PG_PASS = os.getenv("PostgreSQL_PASS", "270z7hIeEI[s)kF~")
 PG_DB = os.getenv("PostgreSQL_DB", "flowpla2_bale_bot")

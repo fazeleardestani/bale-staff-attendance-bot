@@ -2,6 +2,9 @@ import os
 import sys
 import importlib.abc
 import importlib.util
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
 
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
@@ -19,41 +22,54 @@ class _DirectFinder(importlib.abc.MetaPathFinder):
 if not any(isinstance(f, _DirectFinder) for f in sys.meta_path):
     sys.meta_path.insert(0, _DirectFinder())
 
-import os
-import sys
-import logging
-from datetime import datetime
-
-_root = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(_root, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 log_file_path = os.path.join(LOGS_DIR, "bot.log")
+nohup_file_path = os.path.join(_root, "nohup.out")
 
-# Create logger
+# Create main logger
 logger = logging.getLogger("attendance_bot")
 logger.setLevel(logging.DEBUG)
+logger.propagate = False
 
 # Formatter
 log_format = logging.Formatter(
-    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    fmt="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# 1. Console Handler (stdout) - User can see in PowerShell immediately
+# 1. Console Handler (stdout)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(log_format)
 
-# 2. File Handler (logs/bot.log) - Persistent file with UTF-8 encoding
-file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+# 2. Rotating File Handler (logs/bot.log) - Max 10MB per file, keep 5 backups
+file_handler = RotatingFileHandler(
+    log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(log_format)
 
-# Prevent duplicate handlers if reloaded
+# 3. Rotating File Handler (nohup.out in root directory for backward compatibility)
+nohup_handler = RotatingFileHandler(
+    nohup_file_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+nohup_handler.setLevel(logging.INFO)
+nohup_handler.setFormatter(log_format)
+
 if not logger.handlers:
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
+    logger.addHandler(nohup_handler)
+
+# Also configure root logger so logging.error / logging.warning from other modules go to the same files
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not root_logger.handlers:
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(nohup_handler)
 
 def log_callback(user_id, callback_data, action_desc=""):
     desc_str = f" -> {action_desc}" if action_desc else ""
@@ -61,8 +77,7 @@ def log_callback(user_id, callback_data, action_desc=""):
 
 def log_message(user_id, text, step_name=""):
     step_str = f" in step [{step_name}]" if step_name else ""
-    # Truncate text if too long
-    clean_text = text.replace('\n', ' ')[:60]
+    clean_text = str(text or "").replace('\n', ' ')[:60]
     logger.info(f"💬 [MESSAGE] User {user_id}{step_str}: \"{clean_text}\"")
 
 def log_action(user_id, project_id, action_name, details=""):

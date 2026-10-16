@@ -46,14 +46,14 @@ BALE_API_URL = os.getenv("BALE_API_URL", "https://tapi.bale.ai/bot{0}/{1}")
 BALE_FILE_URL = os.getenv("BALE_FILE_URL", "https://tapi.bale.ai/file/bot{0}/{1}")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# PostgreSQL Environment Variables - Changed default host to 127.0.0.1 for local connection
-PG_HOST = os.getenv("PostgreSQL_HOST", "127.0.0.1")
+# قفل کردن هاست دیتابیس روی 127.0.0.1 برای جلوگیری از خواندن دامنه از .env و رفع خطای Connection refused
+PG_HOST = "127.0.0.1"
 PG_USER = os.getenv("PostgreSQL_USER", "flowpla2_fazele")
 PG_PASS = os.getenv("PostgreSQL_PASS", "270z7hIeEI[s)kF~")
 PG_DB = os.getenv("PostgreSQL_DB", "flowpla2_bale_bot")
 PG_PORT = int(os.getenv("PostgreSQL_PORT", "5432"))
 
-DEFAULT_SUPER_ADMINS = [1129742448, 541843838]
+DEFAULT_SUPER_ADMINS = [1129742448]
 super_admins_env = os.getenv("SUPER_ADMINS")
 if super_admins_env:
     SUPER_ADMINS = [int(x.strip()) for x in super_admins_env.split(",") if x.strip().isdigit()]

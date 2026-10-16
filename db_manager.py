@@ -1,9 +1,10 @@
 import os
 import logging
 import subprocess
+import time
 from datetime import datetime
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 from config import PG_HOST, PG_USER, PG_PASS, PG_DB, PG_PORT, SUPER_ADMINS, LOGS_DIR, DB_BACKUPS_DIR
 
@@ -14,28 +15,53 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
+
 class DatabaseUnavailableError(Exception):
     pass
 
+
 class PostgresConnectionWrapper:
-    """پوششی برای شبیه‌سازی رفتار متدهای کانکشن و بازگرداندن اتصال به Pool"""
+    """پوششی ایمن برای مدیریت اتصال‌ها، جلوگیری از نشت کانکشن و بازگرداندن تضمینی به Pool"""
+
     def __init__(self, conn, pool):
         self.conn = conn
         self.pool = pool
+        self._closed = False
 
     def cursor(self):
         return self.conn.cursor(cursor_factory=RealDictCursor)
 
     def commit(self):
-        self.conn.commit()
+        if self.conn and not self._closed:
+            self.conn.commit()
 
     def rollback(self):
-        self.conn.rollback()
+        if self.conn and not self._closed:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def close(self):
-        if self.conn and self.pool:
-            self.pool.putconn(self.conn)
-            self.conn = None
+        if not self._closed and self.conn is not None and self.pool is not None:
+            self._closed = True
+            try:
+                if not self.conn.closed:
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    self.pool.putconn(self.conn)
+                else:
+                    self.pool.putconn(self.conn, close=True)
+            except Exception as e:
+                logging.warning(f"Error returning connection to pool: {e}")
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+            finally:
+                self.conn = None
 
     def __enter__(self):
         return self
@@ -46,40 +72,96 @@ class PostgresConnectionWrapper:
         else:
             self.rollback()
 
+    def __del__(self):
+        if not self._closed:
+            self.close()
+
+
 class DatabaseManager:
-    CURRENT_SCHEMA_VERSION = 9
+    CURRENT_SCHEMA_VERSION = 10
 
     def __init__(self):
         self.pool = None
+        self.active_host = "127.0.0.1"
         self._init_pool()
         self.setup_database()
 
     def _init_pool(self):
-        try:
-            # هاردکد کردن اطلاعات برای دور زدن باگ کش و متغیرهای محیطی
-            self.pool = SimpleConnectionPool(
-                minconn=1,
-                maxconn=20,
-                host="127.0.0.1",
-                database="flowpla2_bale_bot",
-                user="flowpla2_fazele",
-                password="270z7hIeEI[s)kF~",
-                port=5432
-            )
-        except Exception as e:
-            logging.critical(f"Failed to connect to PostgreSQL: {e}")
-            raise DatabaseUnavailableError(f"PostgreSQL is inaccessible: {e}")
+        if self.pool:
+            try:
+                self.pool.closeall()
+            except Exception:
+                pass
+
+        candidate_hosts = ["127.0.0.1", "localhost"]
+        if PG_HOST and PG_HOST not in candidate_hosts and "flowplanner.ir" not in PG_HOST:
+            candidate_hosts.insert(0, PG_HOST)
+
+        last_err = None
+        for host_cand in candidate_hosts:
+            try:
+                self.pool = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=35,
+                    host=host_cand,
+                    database=PG_DB or "flowpla2_bale_bot",
+                    user=PG_USER or "flowpla2_fazele",
+                    password=PG_PASS or "270z7hIeEI[s)kF~",
+                    port=PG_PORT or 5432,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5
+                )
+                self.active_host = host_cand
+                logging.info(
+                    f"Connected to PostgreSQL successfully on host '{host_cand}'")
+                return
+            except Exception as e:
+                last_err = e
+                logging.warning(
+                    f"PostgreSQL connection attempt on host '{host_cand}' failed: {e}")
+
+        logging.critical(
+            f"Failed to connect to PostgreSQL on all candidate hosts: {last_err}")
+        raise DatabaseUnavailableError(
+            f"PostgreSQL is inaccessible: {last_err}")
 
     def get_connection(self):
-        try:
-            conn = self.pool.getconn()
-            conn.autocommit = False # مدیریت دستی تراکنش‌ها
-            return PostgresConnectionWrapper(conn, self.pool)
-        except Exception as e:
-            logging.error(f"Failed to get connection from pool: {e}")
-            raise DatabaseUnavailableError(f"Connection Pool Error: {e}")
+        for attempt in range(3):
+            try:
+                if self.pool is None:
+                    self._init_pool()
+                conn = self.pool.getconn()
+                if conn.closed:
+                    self.pool.putconn(conn, close=True)
+                    conn = self.pool.getconn()
+                else:
+                    try:
+                        conn.isolation_level
+                        with conn.cursor() as test_cur:
+                            test_cur.execute("SELECT 1;")
+                        conn.rollback()
+                    except Exception:
+                        try:
+                            self.pool.putconn(conn, close=True)
+                        except Exception:
+                            pass
+                        conn = self.pool.getconn()
 
-    # اضافه کردن نام‌های جایگزین (Alias) برای جلوگیری از خطای ماژول‌های آپدیت نشده
+                conn.autocommit = False
+                return PostgresConnectionWrapper(conn, self.pool)
+            except Exception as e:
+                logging.warning(
+                    f"Connection pool attempt {attempt + 1} failed: {e}")
+                time.sleep(0.5)
+                try:
+                    self._init_pool()
+                except Exception:
+                    pass
+        raise DatabaseUnavailableError(
+            "Failed to obtain a healthy database connection after retries.")
+
     def get_sqlite_connection(self):
         return self.get_connection()
 
@@ -95,22 +177,24 @@ class DatabaseManager:
             target_path = os.path.join(category_dir, backup_name)
 
             env = os.environ.copy()
-            env['PGPASSWORD'] = "270z7hIeEI[s)kF~"
-            
+            env['PGPASSWORD'] = PG_PASS or "270z7hIeEI[s)kF~"
+
             cmd = [
-                'pg_dump', 
-                '-h', '127.0.0.1', 
-                '-p', '5432', 
-                '-U', 'flowpla2_fazele', 
-                '-F', 'c', 
-                '-f', target_path, 
-                'flowpla2_bale_bot'
+                'pg_dump',
+                '-h', self.active_host,
+                '-p', str(PG_PORT or '5432'),
+                '-U', str(PG_USER or 'flowpla2_fazele'),
+                '-F', 'c',
+                '-f', target_path,
+                str(PG_DB or 'flowpla2_bale_bot')
             ]
-            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+            subprocess.run(cmd, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             try:
                 files = sorted(
-                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".sql")],
+                    [os.path.join(category_dir, f) for f in os.listdir(
+                        category_dir) if f.endswith(".sql")],
                     key=os.path.getmtime
                 )
                 if len(files) > 15:
@@ -121,31 +205,38 @@ class DatabaseManager:
 
             return target_path
         except Exception as e:
-            logging.warning(f"pg_dump command failed (Expected on shared host): {e}")
-            # بازگشت فلگ برای ادامه روند واردات اکسل در صورت عدم دسترسی به shell
+            logging.warning(
+                f"pg_dump command failed (Expected on shared host): {e}")
             return "POSTGRES_NATIVE_TRANSACTION_FALLBACK"
 
     def verify_backup_integrity(self, backup_path):
         if backup_path == "POSTGRES_NATIVE_TRANSACTION_FALLBACK":
             return True
-        return os.path.exists(backup_path) and os.path.getsize(backup_path) > 0
+        return bool(backup_path and os.path.exists(backup_path) and os.path.getsize(backup_path) > 0)
 
     def restore_backup(self, backup_path, destination_path=None):
         if backup_path == "POSTGRES_NATIVE_TRANSACTION_FALLBACK":
             return False
         try:
             env = os.environ.copy()
-            env['PGPASSWORD'] = "270z7hIeEI[s)kF~"
-            
-            # ترمینیت کردن کانکشن‌های فعال قبل از بازیابی دیتابیس
-            term_cmd = [
-                'psql', '-h', '127.0.0.1', '-p', '5432', '-U', 'flowpla2_fazele', '-d', 'postgres',
-                '-c', "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'flowpla2_bale_bot' AND pid <> pg_backend_pid();"
-            ]
-            subprocess.run(term_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            env['PGPASSWORD'] = PG_PASS or "270z7hIeEI[s)kF~"
 
-            cmd = ['pg_restore', '-h', '127.0.0.1', '-p', '5432', '-U', 'flowpla2_fazele', '-d', 'flowpla2_bale_bot', '-c', backup_path]
-            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            term_cmd = [
+                'psql', '-h', self.active_host, '-p', str(PG_PORT or '5432'),
+                '-U', str(PG_USER or 'flowpla2_fazele'), '-d', 'postgres',
+                '-c', f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{PG_DB or 'flowpla2_bale_bot'}' AND pid <> pg_backend_pid();"
+            ]
+            subprocess.run(term_cmd, env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            cmd = [
+                'pg_restore', '-h', self.active_host, '-p', str(
+                    PG_PORT or '5432'),
+                '-U', str(PG_USER or 'flowpla2_fazele'), '-d', str(
+                    PG_DB or 'flowpla2_bale_bot'), '-c', backup_path
+            ]
+            subprocess.run(cmd, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception as e:
             logging.error(f"Postgres restore failed: {e}")
@@ -180,10 +271,14 @@ class DatabaseManager:
                 excel_path TEXT,
                 total_sessions INTEGER DEFAULT 0,
                 recurring_days TEXT DEFAULT '',
-                activation_time TEXT DEFAULT '',
+                activation_time TEXT DEFAULT '07:00',
+                end_time TEXT DEFAULT '23:00',
                 start_date TEXT DEFAULT '',
                 end_date TEXT DEFAULT '',
                 has_prep_day BOOLEAN DEFAULT FALSE,
+                auto_schedule_enabled BOOLEAN DEFAULT TRUE,
+                active_session_id INTEGER,
+                manual_session_override BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             );
@@ -214,6 +309,7 @@ class DatabaseManager:
                 name TEXT NOT NULL,
                 day_of_week TEXT,
                 time_str TEXT,
+                end_time_str TEXT DEFAULT '',
                 location TEXT,
                 is_active BOOLEAN DEFAULT TRUE
             );
@@ -225,6 +321,7 @@ class DatabaseManager:
                 name TEXT NOT NULL,
                 session_date TEXT,
                 time_str TEXT DEFAULT '',
+                end_time_str TEXT DEFAULT '',
                 day_of_week TEXT DEFAULT '',
                 status TEXT DEFAULT 'SCHEDULED',
                 created_at TIMESTAMP
@@ -326,18 +423,33 @@ class DatabaseManager:
             );
             """)
 
+            # مهاجرت خودکار ستون‌های جدید زمان‌بندی برای دیتابیس‌های موجود بدون از دست رفتن اطلاعات
+            migrations = [
+                "ALTER TABLE projects ADD COLUMN IF NOT EXISTS end_time TEXT DEFAULT '23:00';",
+                "ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_schedule_enabled BOOLEAN DEFAULT TRUE;",
+                "ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_session_id INTEGER;",
+                "ALTER TABLE projects ADD COLUMN IF NOT EXISTS manual_session_override BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS end_time_str TEXT DEFAULT '';",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_time_str TEXT DEFAULT '';"
+            ]
+            for mig_sql in migrations:
+                cursor.execute(mig_sql)
+
             indexes = [
                 ("idx_staff_project_active", "project_staff (project_id, is_active)"),
                 ("idx_staff_project_phone", "project_staff (project_id, phone)"),
-                ("idx_schedule_staff_lookup", "schedule_staff (schedule_id, staff_id, is_active)"),
-                ("idx_attendance_lookup", "attendance (project_id, session_id, staff_id)"),
+                ("idx_schedule_staff_lookup",
+                 "schedule_staff (schedule_id, staff_id, is_active)"),
+                ("idx_attendance_lookup",
+                 "attendance (project_id, session_id, staff_id)"),
                 ("idx_sessions_project", "sessions (project_id)"),
                 ("idx_shortages_project", "shortages (project_id, status)"),
                 ("idx_project_users_uid", "project_users (user_id)"),
                 ("idx_staff_logs_date", "staff_logs (log_date, project_id)")
             ]
             for idx_name, idx_def in indexes:
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
 
             now_iso = datetime.now()
             for uid in SUPER_ADMINS:
@@ -356,5 +468,6 @@ class DatabaseManager:
             raise
         finally:
             conn.close()
+
 
 db_instance = DatabaseManager()

@@ -5,6 +5,7 @@ from db_manager import db_instance
 from attendance_manager import attendance_manager
 from utils import safe_markdown, normalize_persian
 
+
 class ClassReportDataBuilder:
     """Extracts, validates, and organizes data for class text reports."""
     @staticmethod
@@ -16,7 +17,7 @@ class ClassReportDataBuilder:
         all_att_raw = attendance_manager.get_session_attendance(project_id, session_id)
         org_chart = project_manager.get_project_org_chart(project_id)
 
-        # --- فیلتر طلایی: حذف نیروهای «بدون شیفت» فقط از گزارش متنی ---
+        # فیلتر طلایی: حذف نیروهای «بدون شیفت» فقط از گزارش متنی
         all_att = [s for s in all_att_raw if "بدون شیفت" not in str(s.get('status', '')).strip()]
 
         proj_name = proj['name'] if proj else "کلاس"
@@ -38,14 +39,13 @@ class ClassReportDataBuilder:
         for s in all_att:
             if s == arshad_staff:
                 continue
-            
+
             u_raw = str(s.get('unit') or '').strip()
             if not u_raw or u_raw == 'None':
                 u_raw = 'عمومی'
 
             sec_raw = str(s.get('section') or '').strip()
-            
-            # --- قانون: اگر اسم بخش و واحد یکی است یا بخش خالی است، بخش را حذف کن ---
+
             if sec_raw in ['None', '', 'عمومی', 'اصلی', '-'] or sec_raw == u_raw:
                 sec_raw = ''
 
@@ -54,7 +54,6 @@ class ClassReportDataBuilder:
             if u_raw not in units_data:
                 units_data[u_raw] = {'heads': [], 'deputies': [], 'sections': {}, 'general_staff': []}
 
-            # Hierarchy Logic
             if pos_raw in ["مسئول واحد", "مدیر", "مدیر واحد"]:
                 units_data[u_raw]['heads'].append(s)
             elif pos_raw in ["جانشین", "معاون", "جانشین مسئول واحد", "جانشین واحد", "جانشین مسئول"]:
@@ -67,7 +66,6 @@ class ClassReportDataBuilder:
                 else:
                     units_data[u_raw]['general_staff'].append(s)
             elif pos_raw == "مسئول":
-                # تشخیص هوشمند مسئول واحد از مسئول بخش
                 if not sec_raw:
                     units_data[u_raw]['heads'].append(s)
                 else:
@@ -75,7 +73,6 @@ class ClassReportDataBuilder:
                         units_data[u_raw]['sections'][sec_raw] = {'heads': [], 'staff': []}
                     units_data[u_raw]['sections'][sec_raw]['heads'].append(s)
             else:
-                # Regular staff
                 if sec_raw:
                     if sec_raw not in units_data[u_raw]['sections']:
                         units_data[u_raw]['sections'][sec_raw] = {'heads': [], 'staff': []}
@@ -83,7 +80,6 @@ class ClassReportDataBuilder:
                 else:
                     units_data[u_raw]['general_staff'].append(s)
 
-        # 3. Determine units order based on org_chart display_order
         ordered_units = list(org_chart.keys())
         for u in units_data.keys():
             if u not in ordered_units:
@@ -99,9 +95,10 @@ class ClassReportDataBuilder:
             'units_data': units_data
         }
 
+
 class PersianClassReportRenderer:
     """Renders validated class report data into the required Persian business format with emojis and Shamsi date."""
-    
+
     @staticmethod
     def to_persian_digits(text):
         persian_digits = "۰۱۲۳۴۵۶۷۸۹"
@@ -111,7 +108,6 @@ class PersianClassReportRenderer:
 
     @staticmethod
     def gregorian_to_jalali(gy, gm, gd):
-        """Standard and precise Gregorian to Jalali (Shamsi) conversion."""
         g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
         gy -= 1600
         gm -= 1
@@ -155,7 +151,7 @@ class PersianClassReportRenderer:
     def convert_date(date_str):
         try:
             parts = date_str.replace('/', '-').split('-')
-            if len(parts) == 3:
+            if len(parts) == 3 and int(parts[0]) > 1900:
                 jy, jm, jd = PersianClassReportRenderer.gregorian_to_jalali(int(parts[0]), int(parts[1]), int(parts[2]))
                 return f"{jy}/{jm:02d}/{jd:02d}"
         except Exception:
@@ -176,7 +172,7 @@ class PersianClassReportRenderer:
         def format_staff(s):
             name = s.get('name', '')
             st = str(s.get('status', '')).strip()
-            
+
             status_icon = "⚪️"
             if "حاضر" in st:
                 status_icon = "✅"
@@ -184,15 +180,9 @@ class PersianClassReportRenderer:
                 status_icon = "❌"
             elif "تاخیر" in st:
                 status_icon = "⏱"
-            
+
             return f"{status_icon} {name}"
 
-        def format_staff_list(staff_list):
-            if not staff_list:
-                return ""
-            return "\n".join([f"  {format_staff(s)}" for s in staff_list])
-
-        # هدر اصلی گزارش
         lines = [f"کلاس سطح: {proj_name}       روز: {sess_day}         تاریخ: {sess_date}\n"]
 
         if arshad:
@@ -209,45 +199,44 @@ class PersianClassReportRenderer:
         div_idx = 0
 
         for u_name in ordered_units:
-            # مدیریت واحدهایی که در چارت هستند اما نیرویی ندارند
             u_data = units_data.get(u_name)
             if not u_data and u_name in org_chart:
                 u_data = {'heads': [], 'deputies': [], 'sections': {}, 'general_staff': []}
-            
-            if not u_data: continue
-            
+
+            if not u_data:
+                continue
+
             has_staff = bool(u_data.get('heads') or u_data.get('deputies') or u_data.get('general_staff'))
             if not has_staff:
                 for sec_data in u_data.get('sections', {}).values():
                     if sec_data.get('heads') or sec_data.get('staff'):
                         has_staff = True
                         break
-            
+
             if not has_staff:
                 continue
-            # ----------------------------------------------------
 
             lines.append(dividers[div_idx])
             div_idx = 1 - div_idx
             lines.append("")
-            
+
             display_unit_name = u_name if "واحد" in u_name else f"واحد {u_name}"
             head_str = ""
             if u_data['heads']:
                 head_str = " ".join([format_staff(h) for h in u_data['heads']])
-            
+
             lines.append(f"*{display_unit_name}:* {head_str}".strip())
-            
+
             deputy_str = ""
             if u_data['deputies']:
                 deputy_str = " ".join([format_staff(d) for d in u_data['deputies']])
-            
+
             if deputy_str or u_data['deputies']:
                 lines.append(f"جانشین مسئول واحد: {deputy_str}".strip())
             else:
                 lines.append("جانشین مسئول واحد:")
             lines.append("")
-            
+
             sections_in_chart = org_chart.get(u_name, [])
             all_unit_sections = list(sections_in_chart)
             for sec in u_data['sections'].keys():
@@ -259,22 +248,22 @@ class PersianClassReportRenderer:
             if valid_secs:
                 for sec in valid_secs:
                     sec_data = u_data['sections'].get(sec, {'heads': [], 'staff': []})
-                    
+
                     sec_head_str = ""
                     if sec_data['heads']:
                         sec_head_str = " ".join([format_staff(sh) for sh in sec_data['heads']])
-                    
+
                     if sec_head_str:
                         lines.append(f"بخش {sec}:\nمسئول بخش: {sec_head_str}".strip())
                     else:
                         lines.append(f"بخش {sec}:".strip())
-                    
+
                     lines.append("نیروها:")
                     if sec_data['staff']:
                         for st in sec_data['staff']:
                             lines.append(f"  {format_staff(st)}")
                     lines.append("")
-            
+
             if u_data['general_staff']:
                 lines.append("نیرو:")
                 for st in u_data['general_staff']:
@@ -282,6 +271,7 @@ class PersianClassReportRenderer:
                 lines.append("")
 
         return "\n".join(lines).strip()
+
 
 class ReportManager:
     def __init__(self, db=db_instance):
@@ -295,7 +285,8 @@ class ReportManager:
 
         for u in all_att:
             unit = u.get("unit", "نامشخص")
-            if not unit or unit == "None": continue
+            if not unit or unit == "None":
+                continue
             unit_safe = safe_markdown(unit)
             if unit_safe not in stats:
                 stats[unit_safe] = {'exp': 0, 'prs_m': 0, 'prs_f': 0, 'abs': 0, 'cg': 0, 'cr': 0}
@@ -308,8 +299,10 @@ class ReportManager:
                 stats[unit_safe]['exp'] += 1
                 total_exp += 1
                 if "حاضر" in st or "تاخیر" in st:
-                    if g == "آقا": stats[unit_safe]['prs_m'] += 1
-                    else: stats[unit_safe]['prs_f'] += 1
+                    if g == "آقا":
+                        stats[unit_safe]['prs_m'] += 1
+                    else:
+                        stats[unit_safe]['prs_f'] += 1
                     total_prs += 1
                 elif "غایب" in st or not st:
                     stats[unit_safe]['abs'] += 1
@@ -331,8 +324,8 @@ class ReportManager:
         today = datetime.now().strftime("%Y-%m-%d")
         now_iso = datetime.now()
         conn = self.db.get_connection()
-        cursor = conn.cursor()
         try:
+            cursor = conn.cursor()
             cursor.execute("""
             INSERT INTO staff_logs (project_id, user_id, action_type, log_date, created_at)
             VALUES (%s, %s, %s, %s, %s)
@@ -346,25 +339,28 @@ class ReportManager:
     def get_staff_performance_report(self, project_id=None, date_str=None):
         target_date = date_str or datetime.now().strftime("%Y-%m-%d")
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        query = """
-        SELECT l.user_id, l.action_type, COUNT(*) as cnt, u.staff_name
-        FROM staff_logs l
-        LEFT JOIN users u ON l.user_id = u.user_id
-        WHERE l.log_date = %s
-        """
-        params = [target_date]
-        if project_id:
-            query += " AND l.project_id = %s"
-            params.append(project_id)
-        query += " GROUP BY l.user_id, l.action_type, u.staff_name"
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            cursor = conn.cursor()
+            query = """
+            SELECT l.user_id, l.action_type, COUNT(*) as cnt, u.staff_name
+            FROM staff_logs l
+            LEFT JOIN users u ON l.user_id = u.user_id
+            WHERE l.log_date = %s
+            """
+            params = [target_date]
+            if project_id:
+                query += " AND l.project_id = %s"
+                params.append(project_id)
+            query += " GROUP BY l.user_id, l.action_type, u.staff_name"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def generate_class_text_report(self, project_id, session_id):
         report_data = ClassReportDataBuilder.build(project_id, session_id)
         return PersianClassReportRenderer.render(report_data)
+
 
 report_manager = ReportManager()

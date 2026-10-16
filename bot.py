@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import importlib.abc
 import importlib.util
 import re
@@ -7,18 +8,6 @@ import re
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
     sys.path.insert(0, _root)
-
-class _DirectFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        name = fullname.split('.')[-1]
-        for p in (path or sys.path):
-            fpath = os.path.join(p or os.getcwd(), name + '.py')
-            if os.path.isfile(fpath):
-                return importlib.util.spec_from_file_location(fullname, fpath)
-        return None
-
-if not any(isinstance(f, _DirectFinder) for f in sys.meta_path):
-    sys.meta_path.insert(0, _DirectFinder())
 
 import requests
 import shutil
@@ -28,7 +17,11 @@ from config import (
 )
 from logger import logger, log_callback, log_message, log_action, log_error
 from db_manager import db_instance, DatabaseUnavailableError
-from utils import normalize_persian, safe_markdown, get_user_emojis, calculate_status_with_delay
+from utils import (
+    safe_markdown, get_user_emojis, calculate_status_with_delay,
+    get_iran_now, get_today_jalali_str, normalize_date_to_jalali,
+    get_persian_weekday, to_persian_digits
+)
 from permission_manager import permission_manager
 from project_manager import project_manager
 from staff_manager import staff_manager
@@ -38,15 +31,66 @@ from excel_manager import excel_manager
 from report_manager import report_manager
 from worker_manager import worker_manager
 
+
+def normalize_persian(text):
+    """نرمال‌سازی پیشرفته برای جستجو: یکسان‌سازی ی، ئ، ي، ى، ک، ك، آ، ا و حذف نیم‌فاصله و فاصله"""
+    if text is None:
+        return ""
+    text = str(text)
+    replacements = {
+        'ئ': 'ی',
+        'ي': 'ی',
+        'ى': 'ی',
+        'ك': 'ک',
+        'ة': 'ه',
+        'ۀ': 'ه',
+        'ؤ': 'و',
+        'إ': 'ا',
+        'أ': 'ا',
+        'آ': 'ا',
+        '\u200c': '',
+        ' ': '',
+        '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+        '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+        '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+        '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+    }
+    for old_char, new_char in replacements.items():
+        text = text.replace(old_char, new_char)
+    return text.strip()
+
+
+def normalize_input_digits(text):
+    """نرمال‌سازی اعداد فارسی و عربی برای ورودی‌های عددی، تاریخ و ساعت (بدون حذف فاصله)"""
+    if text is None:
+        return ""
+    text = str(text)
+    replacements = {
+        'ئ': 'ی',
+        'ي': 'ی',
+        'ى': 'ی',
+        'ك': 'ک',
+        '\u200c': ' ',
+        '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+        '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+        '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+        '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+    }
+    for old_char, new_char in replacements.items():
+        text = text.replace(old_char, new_char)
+    return text.strip()
+
+
 try:
     import telebot
     from telebot import types
     telebot.apihelper.API_URL = BALE_API_URL
     telebot.apihelper.FILE_URL = BALE_FILE_URL
-    bot = telebot.TeleBot(BOT_TOKEN)
+    telebot.apihelper.READ_TIMEOUT = 35
+    telebot.apihelper.CONNECT_TIMEOUT = 15
+    bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
     TELEBOT_AVAILABLE = True
 
-    # --- Safe Network & API Wrappers to prevent 400 timeout & entity parsing crashes ---
     _orig_answer_callback_query = bot.answer_callback_query
     def _safe_answer_callback_query(callback_query_id, text=None, show_alert=None, url=None, cache_time=None):
         try:
@@ -141,6 +185,8 @@ except ImportError:
     bot = DummyBot()
 
 bot_state = {}
+search_queries = {}
+
 
 def get_user_active_project_and_session(user_id):
     pid, sid = permission_manager.get_user_context(user_id)
@@ -151,26 +197,33 @@ def get_user_active_project_and_session(user_id):
             permission_manager.set_user_context(user_id, project_id=pid)
         else:
             return None, None
-            
+
     if pid:
         sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
         if not sessions:
             proj_info = project_manager.get_project(pid)
             if proj_info and proj_info.get('type') == 'کلاس':
                 return pid, None
-                
+
             role, _, _, _, _ = permission_manager.get_user_project_role(pid, user_id)
             if role in ('admin', 'super_admin'):
-                sid = attendance_manager.create_session(pid, "روز 1")
+                today_j = get_today_jalali_str()
+                sid = attendance_manager.create_session(pid, "روز 1", session_date=today_j)
+                project_manager.set_project_active_session(pid, sid, is_manual=False)
                 permission_manager.set_user_context(user_id, project_id=pid, session_id=sid)
             else:
                 return pid, None
         else:
             session_ids = [s['id'] for s in sessions]
-            if sid not in session_ids:
-                sid = sessions[0]['id']
+            # بررسی جلسه فعال خودکار یا قفل‌شده پروژه بر اساس تقویم شمسی
+            resolved_proj_sid = attendance_manager.resolve_project_active_session_id(pid)
+            proj_info = project_manager.get_project(pid)
+            # اگر پروژه روی حالت خودکار است و جلسه امروز وجود دارد، یا جلسه کاربر نامعتبر است، جلسه هماهنگ پروژه ست شود
+            if sid not in session_ids or (proj_info and not proj_info.get('manual_session_override') and resolved_proj_sid and sid != resolved_proj_sid):
+                sid = resolved_proj_sid or sessions[0]['id']
                 permission_manager.set_user_context(user_id, project_id=pid, session_id=sid)
     return pid, sid
+
 
 def send_welcome(message):
     chat_id = message.chat.id
@@ -178,13 +231,13 @@ def send_welcome(message):
     if TELEBOT_AVAILABLE and bot: bot.clear_step_handler_by_chat_id(chat_id)
 
     user = permission_manager.get_user(chat_id)
-    
+
     if not user:
         logger.info(f"Unregistered user attempted access: {chat_id}")
         if TELEBOT_AVAILABLE and bot:
             bot.send_message(
-                chat_id, 
-                f"⛔️ شما در سامانه مدیریت کادر ثبت نشده‌اید.\n\nلطفاً شناسه زیر را کپی کرده و برای مدیر سیستم ارسال کنید تا دسترسی شما ایجاد شود:\n`{chat_id}`", 
+                chat_id,
+                f"⛔️ شما در سامانه مدیریت کادر ثبت نشده‌اید.\n\nلطفاً شناسه زیر را کپی کرده و برای مدیر سیستم ارسال کنید تا دسترسی شما ایجاد شود:\n`{chat_id}`",
                 parse_mode="Markdown"
             )
         return
@@ -233,13 +286,17 @@ def send_welcome(message):
             types.InlineKeyboardButton("📁 پروژه‌های آرشیو شده", callback_data="menu_archived_projects")
         )
 
+    today_fa = to_persian_digits(get_today_jalali_str())
+    weekday_fa = get_persian_weekday()
     admin_badge = "👑 مدیر ارشد کل سامانه" if is_global_admin else "همکار گرامی"
     text = (
-        f"سلام **{user.get('staff_name', 'کاربر')}** ({admin_badge})\n\n"
+        f"سلام **{user.get('staff_name', 'کاربر')}** ({admin_badge})\n"
+        f"📅 امروز: **{weekday_fa} {today_fa}**\n\n"
         f"لطفاً یکی از پروژه‌ها را برای ورود انتخاب نمایید:"
     )
     if TELEBOT_AVAILABLE and bot:
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
 
 def show_project_menu(chat_id, project_id, session_id, message_id=None):
     proj = project_manager.get_project(project_id)
@@ -258,12 +315,18 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
 
     sess = attendance_manager.get_session(session_id)
     sess_name = sess['name'] if sess else "نامشخص"
+    sess_date_str = f" ({to_persian_digits(sess['session_date'])})" if sess and sess.get('session_date') else ""
+
+    in_window, window_reason = project_manager.is_project_currently_in_active_window(project_id, session_id=session_id)
+    window_badge = f"🟢 {window_reason} (نوتیف‌ها فعال)" if in_window else f"🌙 {window_reason} (نوتیف خودکار متوقف)"
+    mode_badge = "📌 دستی" if proj.get('manual_session_override') else "🤖 خودکار تقویم"
 
     if role == "unit_head":
         unit_label = assigned_unit or "نامشخص"
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
             types.InlineKeyboardButton(f"📢 اعلام کمبود نیرو ({unit_label})", callback_data="menu_unit_head_shortage"),
+            types.InlineKeyboardButton(f"📋 مشاهده و لغو کمبودهای واحد {unit_label}", callback_data="menu_view_shortages"),
             types.InlineKeyboardButton(f"📋 کادر واحد {unit_label}", callback_data="menu_unit_head_staff"),
             types.InlineKeyboardButton(f"📊 وضعیت حضور کادر {unit_label}", callback_data="menu_unit_head_attendance"),
             types.InlineKeyboardButton("🔙 تغییر پروژه / خروج", callback_data="menu_switch_project")
@@ -272,7 +335,8 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
         text = (
             f"🏢 **سامانه مدیریت کادر - {proj['name']}**\n\n"
             f"👤 کاربر: **{staff_name}** ({role_fa})\n"
-            f"📅 جلسه فعال: **{sess_name}**\n"
+            f"📅 جلسه فعال: **{sess_name}{sess_date_str}**\n"
+            f"⏰ وضعیت زمانی: {window_badge}\n\n"
             f"عملیات مورد نظر را انتخاب فرمایید:"
         )
         if TELEBOT_AVAILABLE and bot:
@@ -283,9 +347,8 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
                 except Exception: pass
             bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
         return
-    sess_name = sess['name'] if sess else "نامشخص"
 
-    latecomers = attendance_manager.get_latecomers(project_id, session_id)
+    latecomers = attendance_manager.get_latecomers(project_id, session_id) if session_id else []
     late_filtered = permission_manager.apply_gender_filter(latecomers, chat_id, project_id)
     late_count = len(late_filtered)
 
@@ -294,43 +357,46 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
         types.InlineKeyboardButton("🔍 جستجوی نیروی کادر", callback_data="menu_search"),
         types.InlineKeyboardButton("🏢 لیست واحدها", callback_data="menu_units"),
         types.InlineKeyboardButton(f"🚨 لیست متأخرین ({late_count} نفر)", callback_data="menu_late_page_0"),
-        types.InlineKeyboardButton("📢 مشاهده کمبود نیرو", callback_data="menu_view_shortages"),
+        types.InlineKeyboardButton("📢 مشاهده و مدیریت کمبود نیرو", callback_data="menu_view_shortages"),
         types.InlineKeyboardButton("➕ افزودن نیروی جدید", callback_data="menu_add_user")
     )
 
-    if role in ("operator", "user"):
-        is_abs = permission_manager.is_operator_absent_today(project_id, chat_id)
-        abs_btn_text = "✅ اعلام حضور امروز" if is_abs else "🏖 ثبت عدم حضور امروز (مرخصی)"
-        markup.add(types.InlineKeyboardButton(abs_btn_text, callback_data="toggle_my_daily_absence"))
-
-    if role in ("admin", "super_admin"):
+    if role in ("admin", "super_admin") or is_global:
         markup.add(
             types.InlineKeyboardButton("📊 داشبورد آماری (زنده)", callback_data="menu_dashboard"),
             types.InlineKeyboardButton("📋 گزارش عملکرد کادر", callback_data="menu_staff_performance"),
-            types.InlineKeyboardButton(f"📅 تغییر جلسه (فعلی: {sess_name})", callback_data="menu_change_session"),
+            types.InlineKeyboardButton(f"📅 تغییر جلسه (فعلی: {sess_name} | {mode_badge})", callback_data="menu_change_session"),
+            types.InlineKeyboardButton("🗓 مدیریت جلسات، تاریخ و ساعت‌ها", callback_data="menu_manage_sessions"),
+            types.InlineKeyboardButton("⚙️ تنظیمات و زمان‌بندی فعالیت پروژه", callback_data="menu_manage_project"),
             types.InlineKeyboardButton("🔄 آپدیت دیتابیس (آپلود اکسل)", callback_data="menu_update_excel"),
             types.InlineKeyboardButton("📥 دریافت خروجی اکسل", callback_data="download_excel")
         )
 
-    if proj.get('type') == 'کلاس' and role in ("admin", "super_admin"):
+    if proj.get('type') == 'کلاس' and (role in ("admin", "super_admin") or is_global):
         markup.add(types.InlineKeyboardButton("📋 گزارش متنی کادر و حضور", callback_data="menu_class_text_report"))
+
+    if role in ("admin", "super_admin") or is_global:
+        markup.add(
+            types.InlineKeyboardButton("📢 اعلام کمبود نیروی قطعی", callback_data="menu_shortage"),
+            types.InlineKeyboardButton("⏰ ویرایش گروهی ساعت حضور", callback_data="menu_group_shift")
+        )
 
     if role == "super_admin" or is_global:
         markup.add(
-            types.InlineKeyboardButton("📢 اعلام کمبود نیروی قطعی", callback_data="menu_shortage"),
-            types.InlineKeyboardButton("⏰ ویرایش گروهی ساعت حضور", callback_data="menu_group_shift"),
-            types.InlineKeyboardButton("🔑 کادر اجرایی این پروژه", callback_data="menu_permissions"),
-            types.InlineKeyboardButton("🗓 مدیریت جلسات و لغو جلسه", callback_data="menu_manage_sessions"),
-            types.InlineKeyboardButton("⚙️ تنظیمات و مدیریت پروژه", callback_data="menu_manage_project")
+            types.InlineKeyboardButton("🔑 کادر اجرایی این پروژه", callback_data="menu_permissions")
         )
 
     markup.add(types.InlineKeyboardButton("🔙 تغییر پروژه / خروج", callback_data="menu_switch_project"))
 
     role_fa = "مدیر کل سامانه" if is_global else "مدیر ارشد پروژه" if role == "super_admin" else "مدیر پروژه" if role == "admin" else "اپراتور کادر"
+    today_fa = to_persian_digits(get_today_jalali_str())
+    weekday_fa = get_persian_weekday()
     text = (
         f"🏢 **سامانه مدیریت کادر - {proj['name']}**\n\n"
         f"👤 کاربر: **{staff_name}** ({role_fa})\n"
-        f"📅 جلسه فعال: **{sess_name}**\n"
+        f"📆 تقویم روز: **{weekday_fa} {today_fa}**\n"
+        f"📅 جلسه فعال: **{sess_name}{sess_date_str}** ({mode_badge})\n"
+        f"⏰ وضعیت زمانی: {window_badge}\n\n"
         f"عملیات مورد نظر را انتخاب فرمایید:"
     )
 
@@ -341,6 +407,162 @@ def show_project_menu(chat_id, project_id, session_id, message_id=None):
                 return
             except Exception: pass
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
+
+def render_dashboard_page(chat_id, project_id, session_id, page=0, message_id=None, send_all_chunks=False):
+    """رندر صفحه‌بندی شده یا چندپیامی داشبورد آماری برای جلوگیری از خطای 414 سرور بله در متون طولانی"""
+    stats = report_manager.get_dashboard_stats(project_id, session_id)
+    sess = attendance_manager.get_session(session_id)
+    sess_name = safe_markdown(sess['name']) if sess else ""
+
+    sorted_units = sorted(stats['unit_stats'].items())
+    total_units = len(sorted_units)
+
+    summary_footer = (
+        f"\n📈 **آمار کل پروژه در این جلسه:**\n"
+        f"👥 کل مورد انتظار: {stats['total_expected']} | ✅ کل حاضرین: {stats['total_present']} | "
+        f"📊 درصد مشارکت: **{stats['overall_percentage']}%**"
+    )
+
+    if send_all_chunks:
+        header = f"📊 **داشبورد آماری کامل - جلسه {sess_name}**\n\n"
+        chunk = header
+        SAFE_LIMIT = 1400
+        for unit, d in sorted_units:
+            prs = d['prs_m'] + d['prs_f']
+            pct = int((prs / d['exp']) * 100) if d['exp'] > 0 else 0
+            unit_block = (
+                f"🏢 **{unit}**\n"
+                f"👥 باید می‌آمدند: {d['exp']} | ✅ حاضر: {prs} ({pct}%)\n"
+                f"👨🏻 آقا: {d['prs_m']} | 👩🏻 خانم: {d['prs_f']} | ⚠️ غایب: {d['abs']}\n"
+                f"💳 کارت: (تحویل: {d['cg']} / عودت: {d['cr']})\n"
+                f"〰️〰️〰️〰️\n"
+            )
+            if len(chunk) + len(unit_block) > SAFE_LIMIT:
+                bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
+                chunk = unit_block
+            else:
+                chunk += unit_block
+
+        if len(chunk) + len(summary_footer) > SAFE_LIMIT:
+            if chunk.strip():
+                bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
+            chunk = summary_footer.strip()
+        else:
+            chunk += summary_footer
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📄 نمایش صفحه‌ای", callback_data="dash_page_0"),
+            types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")
+        )
+        bot.send_message(chat_id, chunk.strip(), reply_markup=markup, parse_mode="Markdown")
+        return
+
+    items_per_page = 6
+    total_pages = max(1, (total_units - 1) // items_per_page + 1)
+    page = max(0, min(page, total_pages - 1))
+    current_units = sorted_units[page * items_per_page:(page + 1) * items_per_page]
+
+    text = f"📊 **داشبورد آماری زنده - جلسه {sess_name}**\n"
+    if total_pages > 1:
+        text += f"📄 صفحه {page + 1} از {total_pages} (واحدهای {page * items_per_page + 1} تا {min((page + 1) * items_per_page, total_units)} از {total_units})\n\n"
+    else:
+        text += "\n"
+
+    if not current_units:
+        text += "_هیچ واحدی در این جلسه ثبت نشده است._\n"
+    else:
+        for unit, d in current_units:
+            prs = d['prs_m'] + d['prs_f']
+            pct = int((prs / d['exp']) * 100) if d['exp'] > 0 else 0
+            text += (
+                f"🏢 **{unit}**\n"
+                f"👥 باید می‌آمدند: {d['exp']} | ✅ حاضر: {prs} ({pct}%)\n"
+                f"👨🏻 آقا: {d['prs_m']} | 👩🏻 خانم: {d['prs_f']} | ⚠️ غایب: {d['abs']}\n"
+                f"💳 کارت: (تحویل: {d['cg']} / عودت: {d['cr']})\n"
+                f"〰️〰️〰️〰️\n"
+            )
+
+    text += summary_footer
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    nav_btns = []
+    if page > 0:
+        nav_btns.append(types.InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"dash_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_btns.append(types.InlineKeyboardButton("صفحه بعد ▶️", callback_data=f"dash_page_{page + 1}"))
+    if nav_btns:
+        markup.add(*nav_btns)
+
+    if total_pages > 1:
+        markup.add(types.InlineKeyboardButton("📤 ارسال یکجای همه واحدها (در چند پیام)", callback_data="dash_send_all"))
+
+    markup.add(
+        types.InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"dash_page_{page}"),
+        types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")
+    )
+
+    if TELEBOT_AVAILABLE and bot:
+        if message_id:
+            edited = bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+            if not edited:
+                bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
+
+def render_manage_project_menu(chat_id, pid, role, is_global, message_id=None):
+    proj = project_manager.get_project(pid)
+    if not proj:
+        return
+    is_arch = proj.get('status') == 'ARCHIVED'
+    status_fa = "📁 آرشیو شده" if is_arch else "🟢 فعال"
+    start_d = proj.get('start_date') or 'تعیین نشده (همیشه فعال)'
+    end_d = proj.get('end_date') or 'تعیین نشده (همیشه فعال)'
+    act_t = proj.get('activation_time') or '07:00'
+    end_t = proj.get('end_time') or '23:00'
+    rec_days = proj.get('recurring_days') or 'همه روزها'
+    in_win, win_reason = project_manager.is_project_currently_in_active_window(pid)
+
+    text = (
+        f"⚙️ **تنظیمات و زمان‌بندی پروژه: {safe_markdown(proj['name'])}**\n\n"
+        f"🏷 نوع پروژه: **{proj.get('type', 'عمومی')}**\n"
+        f"📝 توضیحات: {safe_markdown(proj.get('description') or 'ندارد')}\n"
+        f"📊 وضعیت کلی: **{status_fa}**\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"📅 **تقویم و ساعات فعالیت پروژه (ملاک ارسال نوتیف):**\n"
+        f"🔹 تاریخ شروع (شمسی): `{start_d}`\n"
+        f"🔹 تاریخ پایان (شمسی): `{end_d}`\n"
+        f"🔹 روزهای فعالیت: **{safe_markdown(rec_days)}**\n"
+        f"⏰ ساعت فعالیت روزانه: از `{act_t}` تا `{end_t}`\n"
+        f"📡 وضعیت فعلی نوتیف‌ها: **{'🟢 فعال' if in_win else '🌙 متوقف'}** ({win_reason})\n\n"
+        f"💡 _توجه: در خارج از تاریخ و ساعت بالا، پروژه آرشیو نمی‌شود و فقط ارسال نوتیفیکیشن‌های خودکار تا زمان فعالیت بعدی متوقف می‌ماند._"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📅 ویرایش تاریخ شروع", callback_data=f"editproj_sdate_{pid}"),
+        types.InlineKeyboardButton("📅 ویرایش تاریخ پایان", callback_data=f"editproj_edate_{pid}"),
+        types.InlineKeyboardButton("⏰ ویرایش ساعت شروع", callback_data=f"editproj_stime_{pid}"),
+        types.InlineKeyboardButton("⏰ ویرایش ساعت پایان", callback_data=f"editproj_etime_{pid}"),
+        types.InlineKeyboardButton("🗓 ویرایش روزهای هفته", callback_data=f"editproj_days_{pid}"),
+        types.InlineKeyboardButton("✏️ ویرایش نام پروژه", callback_data=f"editproj_name_{pid}"),
+        types.InlineKeyboardButton("📝 ویرایش توضیحات", callback_data=f"editproj_desc_{pid}")
+    )
+    if role == "super_admin" or is_global:
+        if is_arch:
+            markup.add(types.InlineKeyboardButton("♻️ فعال‌سازی مجدد (خروج از آرشیو)", callback_data=f"unarchiveproj_{pid}"))
+        else:
+            markup.add(types.InlineKeyboardButton("📁 انتقال دستی به آرشیو", callback_data=f"archiveproj_{pid}"))
+    if is_global:
+        markup.add(types.InlineKeyboardButton("🗑 حذف دائمی پروژه (فقط سوپر ادمین)", callback_data=f"deleteproj_{pid}"))
+    markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی پروژه", callback_data="start_menu"))
+
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
 
 def handle_callbacks(call):
     chat_id = call.message.chat.id
@@ -357,27 +579,16 @@ def handle_callbacks(call):
             try: bot.answer_callback_query(call.id)
             except Exception: pass
 
-        if data == "toggle_my_daily_absence":
-            is_abs = permission_manager.is_operator_absent_today(pid, chat_id)
-            if is_abs:
-                permission_manager.clear_operator_daily_absence(pid, chat_id)
-                bot.answer_callback_query(call.id, "✅ وضعیت شما به «حاضر امروز» تغییر یافت و یادآوری‌ها فعال شد.", show_alert=True)
-            else:
-                permission_manager.record_operator_daily_absence(pid, chat_id)
-                bot.answer_callback_query(call.id, "🏖 عدم حضور شما برای امروز ثبت شد. پیام‌های یادآوری امروز برای شما ارسال نخواهد شد.", show_alert=True)
-            show_project_menu(chat_id, pid, sid, call.message.message_id)
-            return
-
         if data == "menu_switch_project":
             bot_state.pop(chat_id, None)
+            search_queries.pop(chat_id, None)
             permission_manager.set_user_context(chat_id, project_id=None, session_id=None)
             send_welcome(call.message)
             return
 
         if data.startswith("selproj_"):
             pid = int(data.split("_")[1])
-            sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
-            sid = sessions[0]['id'] if sessions else None
+            sid = attendance_manager.resolve_project_active_session_id(pid)
             permission_manager.set_user_context(chat_id, project_id=pid, session_id=sid)
             log_action(chat_id, pid, "Select Project", f"Session: {sid}")
             show_project_menu(chat_id, pid, sid, call.message.message_id)
@@ -616,14 +827,14 @@ def handle_callbacks(call):
                 for d in days:
                     markup.add(types.InlineKeyboardButton(d, callback_data=f"wiz_day_{d}"))
                 markup.add(types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_switch_project"))
-                bot.edit_message_text(f"🌱 پروژه کلاسی: **{pname}**\n\n**مرحله ۳:** روز برگزاری کلاس را انتخاب فرمایید:\n_(یا می‌توانید روزها را به صورت متن ارسال کنید، مثلاً: «یکشنبه‌ها»)_",
+                bot.edit_message_text(f"🌱 پروژه کلاسی: **{pname}**\n\n**مرحله ۳:** روز برگزاری کلاس را انتخاب فرمایید:",
                                       chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             else:
                 markup = types.InlineKeyboardMarkup(row_width=2)
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                markup.add(types.InlineKeyboardButton(f"📅 امروز ({today_str})", callback_data="wiz_start_today"))
+                today_j = get_today_jalali_str()
+                markup.add(types.InlineKeyboardButton(f"📅 امروز ({to_persian_digits(today_j)})", callback_data="wiz_start_today"))
                 markup.add(types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_switch_project"))
-                msg = bot.edit_message_text(f"🏛 رویداد: **{pname}** ({ptype})\n\n**مرحله ۳:** لطفاً **تاریخ شروع رویداد** را انتخاب یا به صورت متنی ارسال فرمایید:\n(مثلاً: `1405/07/01` یا `2026-09-20`)",
+                msg = bot.edit_message_text(f"🏛 رویداد: **{pname}** ({ptype})\n\n**مرحله ۳:** لطفاً **تاریخ شروع رویداد (شمسی)** را انتخاب یا به صورت متنی ارسال فرمایید:\n(مثلاً: `{today_j}`)",
                                             chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
                 bot.register_next_step_handler(msg, process_wiz_start_date_text)
             return
@@ -631,7 +842,7 @@ def handle_callbacks(call):
         if data.startswith("wiz_day_"):
             day_val = data.replace("wiz_day_", "")
             bot_state[chat_id]['recurring_days'] = day_val
-            msg = bot.send_message(chat_id, f"🗓 روز برگزاری: **{day_val}**\n\n**مرحله ۴:** لطفاً **ساعت شروع و فعال‌‌سازی کلاس** را با فرمت `HH:MM` وارد فرمایید:\n(مثلاً: `16:00` یا `08:30`)", parse_mode="Markdown")
+            msg = bot.send_message(chat_id, f"🗓 روز برگزاری: **{day_val}**\n\n**مرحله ۴:** لطفاً **ساعت شروع فعالیت کلاس** را با فرمت `HH:MM` وارد فرمایید:\n(مثلاً: `15:00` یا `08:30`)", parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_wiz_class_time)
             return
 
@@ -642,16 +853,16 @@ def handle_callbacks(call):
             return
 
         if data == "wiz_start_today":
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            bot_state[chat_id]['start_date'] = today_str
-            ask_wiz_end_date(chat_id, today_str)
+            today_j = get_today_jalali_str()
+            bot_state[chat_id]['start_date'] = today_j
+            ask_wiz_end_date(chat_id, today_j)
             return
 
         if data == "wiz_end_sameday":
             sdate = bot_state.get(chat_id, {}).get('start_date', '')
             bot_state[chat_id]['end_date'] = sdate
             bot_state[chat_id]['total_sessions'] = 1
-            ask_wiz_prep_day(chat_id)
+            ask_wiz_event_hours(chat_id)
             return
 
         if data.startswith("wiz_prep_"):
@@ -694,36 +905,75 @@ def handle_callbacks(call):
             return
 
         role, gender, staff_name, is_active, assigned_unit = permission_manager.get_user_project_role(pid, chat_id)
-        if not is_active:
+        if not is_active and not is_global:
             bot.answer_callback_query(call.id, "دسترسی غیرمجاز", show_alert=True)
             return
 
         if data == "menu_manage_project":
-            if role != "super_admin" and not is_global: return
-            proj = project_manager.get_project(pid)
-            if not proj: return
-            is_arch = proj.get('status') == 'ARCHIVED'
-            status_fa = "📁 آرشیو شده" if is_arch else "🟢 فعال"
-            text = (
-                f"⚙️ **تنظیمات و مدیریت پروژه: {safe_markdown(proj['name'])}**\n\n"
-                f"🏷 نوع پروژه: **{proj.get('type', 'عمومی')}**\n"
-                f"📝 توضیحات: {safe_markdown(proj.get('description') or 'ندارد')}\n"
-                f"📊 وضعیت پروژه: **{status_fa}**\n\n"
-                f"عملیات مورد نظر را انتخاب فرمایید:"
+            if role not in ("admin", "super_admin") and not is_global: return
+            render_manage_project_menu(chat_id, pid, role, is_global, message_id=call.message.message_id)
+            return
+
+        if data.startswith("editproj_sdate_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            target_pid = int(data.replace("editproj_sdate_", ""))
+            today_j = get_today_jalali_str()
+            msg = bot.send_message(
+                chat_id,
+                f"📅 لطفاً **تاریخ شروع پروژه (شمسی)** را با فرمت `YYYY/MM/DD` ارسال فرمایید:\n(مثلاً `{today_j}` یا برای حذف محدودیت بنویسید `ندارد`)",
+                reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")),
+                parse_mode="Markdown"
             )
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                types.InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"editproj_name_{pid}"),
-                types.InlineKeyboardButton("📝 ویرایش توضیحات", callback_data=f"editproj_desc_{pid}")
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, "start_date")
+            return
+
+        if data.startswith("editproj_edate_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            target_pid = int(data.replace("editproj_edate_", ""))
+            today_j = get_today_jalali_str()
+            msg = bot.send_message(
+                chat_id,
+                f"📅 لطفاً **تاریخ پایان پروژه (شمسی)** را با فرمت `YYYY/MM/DD` ارسال فرمایید:\n(مثلاً `{today_j}` یا برای حذف محدودیت بنویسید `ندارد`)",
+                reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")),
+                parse_mode="Markdown"
             )
-            if is_arch:
-                markup.add(types.InlineKeyboardButton("♻️ فعال‌سازی مجدد (خروج از آرشیو)", callback_data=f"unarchiveproj_{pid}"))
-            else:
-                markup.add(types.InlineKeyboardButton("📁 اتمام و آرشیو پروژه", callback_data=f"archiveproj_{pid}"))
-            if is_global:
-                markup.add(types.InlineKeyboardButton("🗑 حذف دائمی پروژه (فقط سوپر ادمین)", callback_data=f"deleteproj_{pid}"))
-            markup.add(types.InlineKeyboardButton("🔙 بازگشت به منوی پروژه", callback_data="start_menu"))
-            bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, "end_date")
+            return
+
+        if data.startswith("editproj_stime_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            target_pid = int(data.replace("editproj_stime_", ""))
+            msg = bot.send_message(
+                chat_id,
+                "⏰ لطفاً **ساعت شروع فعالیت روزانه پروژه** را با فرمت `HH:MM` ارسال فرمایید (مثلاً `08:00`):",
+                reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")),
+                parse_mode="Markdown"
+            )
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, "activation_time")
+            return
+
+        if data.startswith("editproj_etime_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            target_pid = int(data.replace("editproj_etime_", ""))
+            msg = bot.send_message(
+                chat_id,
+                "⏰ لطفاً **ساعت پایان فعالیت روزانه پروژه** را با فرمت `HH:MM` ارسال فرمایید (مثلاً `21:00`):\n_(پس از این ساعت، نوتیفیکیشن‌های متأخرین متوقف می‌شود)_",
+                reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")),
+                parse_mode="Markdown"
+            )
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, "end_time")
+            return
+
+        if data.startswith("editproj_days_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            target_pid = int(data.replace("editproj_days_", ""))
+            msg = bot.send_message(
+                chat_id,
+                "🗓 لطفاً **روزهای فعالیت پروژه** را ارسال فرمایید (مثلاً `پنج‌شنبه` یا `یکشنبه، سه‌شنبه` یا برای همه روزها بنویسید `هرروز`):",
+                reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")),
+                parse_mode="Markdown"
+            )
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, "recurring_days")
             return
 
         if data.startswith("deleteproj_"):
@@ -781,15 +1031,15 @@ def handle_callbacks(call):
             return
 
         if data.startswith("editproj_name_"):
-            if role != "super_admin" and not is_global: return
+            if role not in ("admin", "super_admin") and not is_global: return
             target_pid = int(data.replace("editproj_name_", ""))
-            msg = bot.send_message(chat_id, "✏️️ لطفاً **نام جدید پروژه** را ارسال فرمایید:",
+            msg = bot.send_message(chat_id, "✏️ لطفاً **نام جدید پروژه** را ارسال فرمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")), parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_edit_project_name, target_pid)
             return
 
         if data.startswith("editproj_desc_"):
-            if role != "super_admin" and not is_global: return
+            if role not in ("admin", "super_admin") and not is_global: return
             target_pid = int(data.replace("editproj_desc_", ""))
             msg = bot.send_message(chat_id, "📝 لطفاً **توضیحات جدید پروژه** را ارسال فرمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_project")), parse_mode="Markdown")
@@ -797,28 +1047,24 @@ def handle_callbacks(call):
             return
 
         if data == "menu_class_text_report":
-            if role not in ("admin", "super_admin"): return
+            if role not in ("admin", "super_admin") and not is_global: return
             rep_text = report_manager.generate_class_text_report(pid, sid)
             markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
-            
-            # در پیام‌رسان بله، متون طولانی فارسی باعث خطای 414 Nginx می‌شوند.
-            # متن را خط به خط و با محدودیت امن ۱۵۰۰ کاراکتر می‌‌شکنیم تا مارک‌داون‌ها خراب نشوند.
+
             SAFE_LIMIT = 1500
             if len(rep_text) > SAFE_LIMIT:
                 lines = rep_text.split('\n')
                 chunk = ""
                 for line in lines:
-                    # اگر خط فعلی را اضافه کنیم و از محدودیت رد شود، چانک فعلی را می‌فرستیم
                     if len(chunk) + len(line) + 1 > SAFE_LIMIT:
                         bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
                         chunk = line + "\n"
                     else:
                         chunk += line + "\n"
-                
-                # ارسال قسمت باقیمانده
+
                 if chunk.strip():
                     bot.send_message(chat_id, chunk.strip(), parse_mode="Markdown")
-                    
+
                 bot.send_message(chat_id, "✅ گزارش کادر و حضور جلسه فعال ارسال گردید.", reply_markup=markup)
             else:
                 bot.send_message(chat_id, rep_text, reply_markup=markup, parse_mode="Markdown")
@@ -839,7 +1085,7 @@ def handle_callbacks(call):
             staff_id = staff_manager.add_staff_member(sh['project_id'], c_name, c_phone, sh['unit'], sh['section'], position="نیرو", gender=c_gender)
             sessions = attendance_manager.list_sessions(sh['project_id'])
             for s in sessions:
-                attendance_manager.update_attendance_status(sh['project_id'], s['id'], staff_id, "")
+                attendance_manager.add_staff_to_session_roster(sh['project_id'], s['id'], [staff_id])
             bot.answer_callback_query(call.id, "نیرو با موفقیت تایید و به کادر اضافه شد ✅", show_alert=True)
             try:
                 bot.edit_message_text(f"✅ نیروی پیشنهادی (**{c_name}**) توسط شما تایید و به کادر واحد **{sh['unit']}** اضافه گردید.", chat_id, call.message.message_id, parse_mode="Markdown")
@@ -874,47 +1120,73 @@ def handle_callbacks(call):
 
         if data == "menu_change_session":
             sessions = attendance_manager.list_sessions(pid, include_cancelled=False)
+            proj_info = project_manager.get_project(pid)
+            is_manual = proj_info.get('manual_session_override', False) if proj_info else False
+            today_j = get_today_jalali_str()
+
             markup = types.InlineKeyboardMarkup(row_width=2)
             for s in sessions:
-                status_icon = "🟢" if s['status'] == 'SCHEDULED' else "🔵"
-                markup.add(types.InlineKeyboardButton(f"{status_icon} {s['name']}", callback_data=f"setsess_{s['id']}"))
+                s_date = s.get('session_date') or ''
+                is_today_s = (s_date == today_j)
+                active_mark = "✅ " if s['id'] == sid else "🟢 " if is_today_s else "🔹 "
+                date_lbl = f" ({to_persian_digits(s_date)})" if s_date else ""
+                markup.add(types.InlineKeyboardButton(f"{active_mark}{s['name']}{date_lbl}", callback_data=f"setsess_{s['id']}"))
+
+            if is_manual:
+                markup.add(types.InlineKeyboardButton("🔄 بازگشت به حالت خودکار تقویم روز", callback_data="setsess_auto"))
             markup.add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu"))
-            bot.edit_message_text("لطفاً جلسه مورد نظر را برای مدیریت انتخاب فرمایید:", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+            mode_desc = "📌 **حالت فعلی: انتخاب دستی توسط مدیر**" if is_manual else "🤖 **حالت فعلی: انتخاب خودکار بر اساس تاریخ شمسی روز**"
+            bot.edit_message_text(
+                f"📅 **انتخاب جلسه فعال پروژه**\n{mode_desc}\n\n"
+                f"لطفاً جلسه مورد نظر را جهت فعال‌سازی انتخاب فرمایید:",
+                chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown"
+            )
+            return
+
+        if data == "setsess_auto":
+            project_manager.set_project_active_session(pid, sid, is_manual=False)
+            auto_sid = attendance_manager.resolve_project_active_session_id(pid) or sid
+            permission_manager.set_user_context(chat_id, project_id=pid, session_id=auto_sid)
+            bot.answer_callback_query(call.id, "انتخاب جلسه روی حالت خودکار تقویم روز قرار گرفت 🤖✅", show_alert=True)
+            show_project_menu(chat_id, pid, auto_sid, call.message.message_id)
             return
 
         if data.startswith("setsess_"):
             new_sid = int(data.split("_")[1])
+            project_manager.set_project_active_session(pid, new_sid, is_manual=True)
             permission_manager.set_user_context(chat_id, project_id=pid, session_id=new_sid)
-            log_action(chat_id, pid, "Switch Session", f"New Session: {new_sid}")
-            bot.answer_callback_query(call.id, "جلسه فعال تغییر یافت ✅")
+            log_action(chat_id, pid, "Switch Session Manual", f"New Session: {new_sid}")
+            bot.answer_callback_query(call.id, "جلسه فعال به صورت دستی تغییر یافت ✅")
             show_project_menu(chat_id, pid, new_sid, call.message.message_id)
             return
 
         if data == "menu_manage_sessions":
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             sessions = attendance_manager.list_sessions(pid, include_cancelled=True)
             markup = types.InlineKeyboardMarkup(row_width=1)
             for s in sessions:
                 is_canc = s.get('status') == 'CANCELLED'
                 c_icon = "❌ لغوشده" if is_canc else "🟢 فعال"
+                d_str = f" [{to_persian_digits(s['session_date'])}]" if s.get('session_date') else ""
                 day_str = f" ({s['day_of_week']})" if s.get('day_of_week') else ""
-                btn_txt = f"{s['name']}{day_str} | {c_icon}"
+                btn_txt = f"{s['name']}{d_str}{day_str} | {c_icon}"
                 markup.add(types.InlineKeyboardButton(btn_txt, callback_data=f"sess_detail_{s['id']}"))
             markup.add(
-                types.InlineKeyboardButton("➕ ایجاد جلسه جدید (با کپی کادر روز قبل)", callback_data="add_new_session_prompt"),
+                types.InlineKeyboardButton("➕ ایجاد جلسه جدید", callback_data="add_new_session_prompt"),
                 types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu")
             )
-            bot.edit_message_text("🗓 **مدیریت جلسات پروژه:**\nبرای مشاهده جزییات و ویرایش اطلاعات هر جلسه روی آن کلیک فرمایید:", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            bot.edit_message_text("🗓 **مدیریت جلسات، تاریخ شمسی و ساعات فعالیت:**\nبرای مشاهده جزییات و ویرایش تاریخ یا ساعت هر جلسه روی آن کلیک فرمایید:", chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
         if data.startswith("sess_detail_"):
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             target_sid = int(data.replace("sess_detail_", ""))
             show_session_details(chat_id, pid, target_sid, call.message.message_id)
             return
 
         if data.startswith("togglesess_"):
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             target_sid = int(data.replace("togglesess_", ""))
             attendance_manager.toggle_session_status(target_sid)
             bot.answer_callback_query(call.id, "وضعیت جلسه تغییر یافت ✅", show_alert=True)
@@ -922,27 +1194,41 @@ def handle_callbacks(call):
             return
 
         if data.startswith("editsess_"):
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             parts = data.split("_")
             field_name = parts[1]
             target_sid = int(parts[2])
-            field_fa = "نام جلسه" if field_name == "name" else "تاریخ جلسه" if field_name == "date" else "ساعت جلسه" if field_name == "time" else "روز هفته"
-            db_col = "name" if field_name == "name" else "session_date" if field_name == "date" else "time_str" if field_name == "time" else "day_of_week"
+            if field_name == "name":
+                field_fa = "نام جلسه"
+                db_col = "name"
+            elif field_name == "date":
+                field_fa = "تاریخ شمسی جلسه (مثلاً 1405/07/25)"
+                db_col = "session_date"
+            elif field_name == "time":
+                field_fa = "ساعت شروع جلسه (مثلاً 08:00)"
+                db_col = "time_str"
+            elif field_name == "etime":
+                field_fa = "ساعت پایان جلسه (مثلاً 20:00)"
+                db_col = "end_time_str"
+            else:
+                field_fa = "روز هفته (مثلاً پنج‌شنبه)"
+                db_col = "day_of_week"
+
             msg = bot.send_message(chat_id, f"✏️ لطفاً مقدار جدید برای **{field_fa}** را ارسال فرمایید:",
-                                   reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data=f"sess_detail_{target_sid}")))
+                                   reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data=f"sess_detail_{target_sid}")), parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_edit_session_field, target_sid, db_col)
             return
 
         if data == "add_new_session_prompt":
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             bot_state[chat_id] = {'type': 'add_session', 'pid': pid}
-            msg = bot.send_message(chat_id, "🗓 نام جلسه جدید را ارسال فرمایید (مثلاً `جلسه ۵` یا `1405/08/04`):",
+            msg = bot.send_message(chat_id, "🗓 نام جلسه جدید را ارسال فرمایید (مثلاً `جلسه ۵` یا `روز ۳`):",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="menu_manage_sessions")), parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_add_session_name)
             return
 
         if data == "menu_update_excel":
-            if role not in ("admin", "super_admin"): return
+            if role not in ("admin", "super_admin") and not is_global: return
             msg = bot.send_message(chat_id, "🔄 **آپدیت دیتابیس از روی اکسل:**\n\nلطفاً فایل اکسل تکمیل‌شده این پروژه را ارسال نمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu")), parse_mode="Markdown")
             bot.register_next_step_handler(msg, process_update_excel_file, pid)
@@ -952,6 +1238,15 @@ def handle_callbacks(call):
             msg = bot.send_message(chat_id, "🔍 بخشی از نام، فامیل، شماره تماس، بخش یا عنوان کارت نیرو را ارسال فرمایید:",
                                    reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu")))
             bot.register_next_step_handler(msg, process_search, pid, sid)
+            return
+
+        if data.startswith("sp_"):
+            page = int(data.replace("sp_", ""))
+            saved_q = search_queries.get(chat_id, "")
+            if not saved_q:
+                bot.answer_callback_query(call.id, "عبارت جستجو منقضی شده است، لطفاً مجدداً جستجو کنید.", show_alert=True)
+                return
+            render_search_page(chat_id, pid, sid, saved_q, page, call.message.message_id)
             return
 
         if data == "menu_units":
@@ -1047,29 +1342,19 @@ def handle_callbacks(call):
             bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             return
 
-        if data == "menu_dashboard":
-            if role not in ("admin", "super_admin"): return
-            stats = report_manager.get_dashboard_stats(pid, sid)
-            sess = attendance_manager.get_session(sid)
-            sess_name = sess['name'] if sess else ""
+        if data == "menu_dashboard" or data.startswith("dash_page_"):
+            if role not in ("admin", "super_admin") and not is_global: return
+            page = int(data.replace("dash_page_", "")) if data.startswith("dash_page_") else 0
+            render_dashboard_page(chat_id, pid, sid, page=page, message_id=call.message.message_id)
+            return
 
-            text = f"📊 **داشبورد آماری زنده - جلسه {sess_name}**\n\n"
-            for unit, d in sorted(stats['unit_stats'].items()):
-                prs = d['prs_m'] + d['prs_f']
-                pct = int((prs / d['exp']) * 100) if d['exp'] > 0 else 0
-                text += f"🏢 **{unit}**\n"
-                text += f"👥 باید می‌آمدند: {d['exp']} | ✅ حاضر: {prs} ({pct}%)\n"
-                text += f"👨🏻 آقا: {d['prs_m']} | 👩🏻 خانم: {d['prs_f']} | ⚠️ غایب: {d['abs']}\n"
-                text += f"💳 کارت: (تحویل: {d['cg']} / عودت: {d['cr']})\n〰️〰️〰️〰️\n"
-
-            text += f"\n📈 **آمار کل:**\nکل مورد انتظار: {stats['total_expected']} | کل حاضرین: {stats['total_present']} | درصد مشارکت: **{stats['overall_percentage']}%**"
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu_dashboard"), types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
-            bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        if data == "dash_send_all":
+            if role not in ("admin", "super_admin") and not is_global: return
+            render_dashboard_page(chat_id, pid, sid, page=0, message_id=None, send_all_chunks=True)
             return
 
         if data == "menu_staff_performance":
-            if role not in ("admin", "super_admin"): return
+            if role not in ("admin", "super_admin") and not is_global: return
             logs = report_manager.get_staff_performance_report(pid)
             text = "📋 **گزارش عملکرد کادر پروژه:**\n\n"
             if not logs:
@@ -1221,6 +1506,7 @@ def handle_callbacks(call):
                 return
 
             shortage_manager.approve_unit_head_shortage(sh_id)
+            shortage_manager.mark_shortage_notified(sh_id)
             bot.answer_callback_query(call.id, "درخواست کمبود تایید و برودکست شد ✅", show_alert=True)
 
             proj = project_manager.get_project(sh['project_id'])
@@ -1259,10 +1545,16 @@ def handle_callbacks(call):
             sh = shortage_manager.get_shortage(sh_id)
             u_title = sh['unit'] if sh else ""
             s_title = sh['section'] if sh else ""
-            shortage_manager.reject_shortage(sh_id)
-            bot.answer_callback_query(call.id, "درخواست کمبود رد شد ❌", show_alert=True)
+            conn = db_instance.get_connection()
             try:
-                bot.edit_message_text(f"❌ درخواست کمبود نیرو در واحد **{u_title}** رد گردید.", chat_id, call.message.message_id, parse_mode="Markdown")
+                cur = conn.cursor()
+                cur.execute("DELETE FROM shortages WHERE id = %s", (sh_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            bot.answer_callback_query(call.id, "درخواست کمبود رد و حذف شد ❌", show_alert=True)
+            try:
+                bot.edit_message_text(f"❌ درخواست کمبود نیرو در واحد **{u_title}** رد و حذف گردید.", chat_id, call.message.message_id, parse_mode="Markdown")
             except Exception: pass
 
             if uh_id:
@@ -1280,9 +1572,43 @@ def handle_callbacks(call):
             bot.register_next_step_handler(msg, process_admin_edit_uh_count, sh_id, uh_id)
             return
 
+        if data.startswith("delshrt_"):
+            sh_id = int(data.replace("delshrt_", ""))
+            sh = shortage_manager.get_shortage(sh_id)
+            if not sh or sh['project_id'] != pid:
+                bot.answer_callback_query(call.id, "کمبود مورد نظر در این پروژه یافت نشد.", show_alert=True)
+                return
+
+            can_delete = (role in ('admin', 'super_admin') or is_global or
+                          (role == 'unit_head' and assigned_unit == sh.get('unit')))
+            if not can_delete:
+                bot.answer_callback_query(call.id, "⛔️ شما مجاز به حذف یا لغو این کمبود نیستید.", show_alert=True)
+                return
+
+            u_title = sh.get('unit', '')
+            s_title = sh.get('section', '')
+            conn = db_instance.get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM shortages WHERE id = %s AND project_id = %s", (sh_id, pid))
+                conn.commit()
+            finally:
+                conn.close()
+
+            log_action(chat_id, pid, "Delete/Cancel Shortage", f"ID: {sh_id}, Unit: {u_title}, Sec: {s_title}")
+            bot.answer_callback_query(call.id, f"کمبود واحد «{u_title} - {s_title}» با موفقیت لغو و حذف شد 🗑", show_alert=True)
+            call.data = "menu_view_shortages"
+            handle_callbacks(call)
+            return
+
         if data == "menu_view_shortages":
             shortages = shortage_manager.get_all_unresolved_shortages(pid)
+            if role == "unit_head" and assigned_unit:
+                shortages = [s for s in shortages if s.get('unit') == assigned_unit]
+
             markup = types.InlineKeyboardMarkup(row_width=1)
+            is_proj_manager = (role in ('admin', 'super_admin') or is_global)
+
             if not shortages:
                 text = "✅ هیچ کمبود تامین نشده‌ای در این پروژه وجود ندارد."
             else:
@@ -1290,26 +1616,33 @@ def handle_callbacks(call):
                 for sh in shortages:
                     sid_sh = sh['id']
                     st = sh['status']
+                    cnt_sh = sh.get('count', 1)
                     if st == 'تامین نشده':
-                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 جنسیت: {sh['target_group']}\n📝 توضیحات: {sh['description']}\n〰️〰️〰〰️\n"
-                        markup.add(types.InlineKeyboardButton(f"🙋🏻‍♂️ معرفی نیرو: {sh['unit']} - {sh['section']}", callback_data=f"suggestshrt_{sid_sh}"))
+                        text += f"🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{cnt_sh} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰️〰️〰️〰️\n"
+                        if role != "unit_head":
+                            markup.add(types.InlineKeyboardButton(f"🙋🏻‍♂️ معرفی نیرو: {sh['unit']} - {sh['section']}", callback_data=f"suggestshrt_{sid_sh}"))
+                        if is_proj_manager or (role == "unit_head" and assigned_unit == sh.get('unit')):
+                            markup.add(types.InlineKeyboardButton(f"🗑 حذف / لغو کمبود: {sh['unit']} - {sh['section']}", callback_data=f"delshrt_{sid_sh}"))
                     elif st == 'در انتظار تایید ادمین':
-                        text += f"📢 **درخواست کمبود مسئول واحد (در انتظار بررسی):**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{sh['count']} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰〰️〰️〰️\n"
-                        if role in ('admin', 'super_admin') or is_global:
+                        text += f"📢 **درخواست کمبود مسئول واحد (در انتظار بررسی):**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👥 تعداد: **{cnt_sh} نفر** ({sh.get('target_group', 'عمومی')})\n📝 توضیحات: {sh.get('description') or 'ندارد'}\n〰️〰️〰️〰️\n"
+                        if is_proj_manager:
                             req_by = sh.get('requested_by') or 0
                             markup.add(
                                 types.InlineKeyboardButton(f"✅ تایید: {sh['unit']} - {sh['section']}", callback_data=f"appr_uh_shrt_{sid_sh}_{req_by}"),
-                                types.InlineKeyboardButton(f"❌ رد: {sh['unit']}", callback_data=f"rej_uh_shrt_{sid_sh}_{req_by}")
+                                types.InlineKeyboardButton(f"🗑 رد و حذف کمبود: {sh['unit']} - {sh['section']}", callback_data=f"rej_uh_shrt_{sid_sh}_{req_by}")
                             )
+                        elif role == "unit_head" and assigned_unit == sh.get('unit'):
+                            markup.add(types.InlineKeyboardButton(f"🗑 لغو درخواست کمبود: {sh['unit']} - {sh['section']}", callback_data=f"delshrt_{sid_sh}"))
                     elif st == 'در انتظار تایید':
-                        text += f"⏳ **در انتظار تایید ادمین:**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👤 نیروی پیشنهادی: {sh.get('assigned_name', '')} ({sh.get('phone', '')})\n〰️〰️〰️〰\n"
-                        if role in ('admin', 'super_admin'):
+                        text += f"⏳ **در انتظار تایید ادمین:**\n🏢 واحد: **{sh['unit']}** | 🗂 بخش: **{sh['section']}**\n👤 نیروی پیشنهادی: {sh.get('assigned_name', '')} ({sh.get('phone', '')})\n〰️〰️〰️〰️\n"
+                        if is_proj_manager:
                             markup.add(types.InlineKeyboardButton(f"✅ تایید پیشنهاد: {sh['unit']} - {sh['section']}", callback_data=f"approveshrt_{sid_sh}"))
-                            markup.add(types.InlineKeyboardButton(f"❌ رد پیشنهاد: {sh['unit']} - {sh['section']}", callback_data=f"rejectshrt_{sid_sh}"))
+                            markup.add(types.InlineKeyboardButton(f"❌ رد پیشنهاد (ابقای کمبود): {sh['unit']} - {sh['section']}", callback_data=f"rejectshrt_{sid_sh}"))
+                            markup.add(types.InlineKeyboardButton(f"🗑 حذف کامل این کمبود: {sh['unit']} - {sh['section']}", callback_data=f"delshrt_{sid_sh}"))
 
             markup.add(types.InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu_view_shortages"), types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
             try: bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-            except: pass
+            except Exception: pass
             return
 
         if data.startswith("suggestshrt_"):
@@ -1320,9 +1653,21 @@ def handle_callbacks(call):
             return
 
         if data.startswith("approveshrt_"):
-            if role not in ('admin', 'super_admin'): return
+            if role not in ('admin', 'super_admin') and not is_global: return
             sh_id = int(data.split("_")[1])
+            sh = shortage_manager.get_shortage(sh_id)
+            if not sh or sh['project_id'] != pid:
+                bot.answer_callback_query(call.id, "کمبود یافت نشد.", show_alert=True)
+                return
             shortage_manager.approve_shortage(sh_id)
+            c_name = sh.get('assigned_name')
+            c_phone = sh.get('phone') or ""
+            c_gender = sh.get('target_group') or "خانم"
+            if c_name:
+                staff_id = staff_manager.add_staff_member(sh['project_id'], c_name, c_phone, sh['unit'], sh['section'], position="نیرو", gender=c_gender)
+                sessions = attendance_manager.list_sessions(sh['project_id'])
+                for s in sessions:
+                    attendance_manager.add_staff_to_session_roster(sh['project_id'], s['id'], [staff_id])
             log_action(chat_id, pid, "Approve Shortage", f"ID: {sh_id}")
             bot.answer_callback_query(call.id, "کمبود تأمین و تأیید شد ✅", show_alert=True)
             call.data = "menu_view_shortages"
@@ -1330,17 +1675,17 @@ def handle_callbacks(call):
             return
 
         if data.startswith("rejectshrt_"):
-            if role not in ('admin', 'super_admin'): return
+            if role not in ('admin', 'super_admin') and not is_global: return
             sh_id = int(data.split("_")[1])
             shortage_manager.reject_shortage(sh_id)
             log_action(chat_id, pid, "Reject Shortage", f"ID: {sh_id}")
-            bot.answer_callback_query(call.id, "پیشنهاد رد شد ❌", show_alert=True)
+            bot.answer_callback_query(call.id, "پیشنهاد رد شد و کمبود مجدداً باز شد ❌", show_alert=True)
             call.data = "menu_view_shortages"
             handle_callbacks(call)
             return
 
         if data == "menu_shortage":
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             chart = project_manager.get_project_org_chart(pid)
             units = sorted(list(chart.keys()))
             if not units:
@@ -1394,7 +1739,7 @@ def handle_callbacks(call):
             return
 
         if data == "menu_group_shift":
-            if role != "super_admin": return
+            if role not in ("admin", "super_admin") and not is_global: return
             chart = project_manager.get_project_org_chart(pid)
             units = sorted(list(chart.keys()))
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1548,7 +1893,7 @@ def handle_callbacks(call):
             uname = t_user['staff_name'] if t_user else f"کاربر {t_uid}"
             t_role, _, _, t_active, t_unit = permission_manager.get_user_project_role(pid, t_uid)
             curr_role_fa = "مدیر پروژه" if t_role == 'admin' else f"مسئول واحد {t_unit}" if t_role == 'unit_head' else "اپراتور کادر"
-            
+
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(
                 types.InlineKeyboardButton("🛡 تنظیم به عنوان مدیر پروژه (Admin)", callback_data=f"proj_applyrole_{t_uid}_admin"),
@@ -1651,20 +1996,20 @@ def handle_callbacks(call):
             return
 
         if data == "download_excel":
-            if role not in ("admin", "super_admin"): return
+            if role not in ("admin", "super_admin") and not is_global: return
             bot.send_message(chat_id, "⏳ در حال استخراج آخرین اطلاعات در فایل اکسل...")
             out_path = excel_manager.export_project_excel(pid)
             if out_path and os.path.exists(out_path):
                 proj = project_manager.get_project(pid)
                 log_action(chat_id, pid, "Export Excel", f"File: {out_path}")
                 with open(out_path, "rb") as f:
-                    bot.send_document(chat_id, f, caption=f"📥 آخرین نسخه اکسل پروژه: {proj['name']}\nتاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                    bot.send_document(chat_id, f, caption=f"📥 آخرین نسخه اکسل پروژه: {proj['name']}\nتاریخ: {get_today_jalali_str()} {get_iran_now().strftime('%H:%M')}")
             else:
                 log_error(chat_id, f"Failed to export excel for project {pid}")
                 bot.send_message(chat_id, "❌ خطا در تولید خروجی اکسل.")
             return
 
-        logger.warning(f"⚠️️ Unhandled callback received: '{data}' from User {chat_id}")
+        logger.warning(f"⚠️ Unhandled callback received: '{data}' from User {chat_id}")
         if TELEBOT_AVAILABLE and bot:
             bot.answer_callback_query(call.id, "دستور نامشخص یا منقضی‌شده", show_alert=False)
 
@@ -1674,18 +2019,261 @@ def handle_callbacks(call):
             try: bot.answer_callback_query(call.id, "خطا در پردازش عملیات", show_alert=True)
             except Exception: pass
 
+
+# --- تمامی توابع پردازش مرحله‌به‌مرحله (Next Step Handlers) ---
+
+def process_edit_project_schedule_field(message, target_pid, field_key):
+    chat_id = message.chat.id
+    if not message.text:
+        return
+    raw_val = normalize_input_digits(message.text.strip())
+    log_message(chat_id, raw_val, f"process_edit_project_schedule_{field_key}")
+
+    if raw_val in ("ندارد", "حذف", "خالی", "-"):
+        clean_val = ""
+    else:
+        clean_val = raw_val
+
+    if field_key in ("activation_time", "end_time") and clean_val:
+        if not re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', clean_val):
+            msg = bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً مانند `08:00` یا `20:30` ارسال فرمایید:", parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, field_key)
+            return
+        parts = clean_val.split(":")
+        clean_val = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+
+    if field_key in ("start_date", "end_date") and clean_val:
+        norm_d = normalize_date_to_jalali(clean_val)
+        if not re.match(r'^\d{4}/\d{2}/\d{2}$', norm_d):
+            msg = bot.send_message(chat_id, "❌ فرمت تاریخ نامعتبر است. لطفاً تاریخ شمسی را مانند `1405/07/24` ارسال فرمایید:", parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_edit_project_schedule_field, target_pid, field_key)
+            return
+        clean_val = norm_d
+
+    try:
+        kwargs = {field_key: clean_val}
+        project_manager.update_project_schedule_config(target_pid, **kwargs)
+        log_action(chat_id, target_pid, f"Update Project {field_key}", f"Val: {clean_val}")
+        bot.send_message(
+            chat_id,
+            f"✅ تنظیمات زمان‌بندی پروژه با موفقیت به `{clean_val or 'بدون محدودیت'}` تغییر یافت.",
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("⚙️ بازگشت به تنظیمات پروژه", callback_data="menu_manage_project")),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ خطا در ذخیره تنظیمات: {e}")
+
+
+def process_edit_project_name(message, target_pid):
+    chat_id = message.chat.id
+    if not message.text:
+        return
+    new_name = message.text.strip()
+    log_message(chat_id, new_name, "process_edit_project_name")
+    try:
+        project_manager.update_project_details(target_pid, name=new_name)
+        log_action(chat_id, target_pid, "Edit Project Name", f"New Name: {new_name}")
+        bot.send_message(
+            chat_id,
+            f"✅ نام پروژه با موفقیت به «**{safe_markdown(new_name)}**» تغییر یافت.",
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت به تنظیمات پروژه", callback_data="menu_manage_project")),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ خطا در تغییر نام پروژه: {e}")
+
+
+def process_edit_project_desc(message, target_pid):
+    chat_id = message.chat.id
+    if not message.text:
+        return
+    new_desc = message.text.strip()
+    log_message(chat_id, new_desc, "process_edit_project_desc")
+    try:
+        project_manager.update_project_details(target_pid, description=new_desc)
+        log_action(chat_id, target_pid, "Edit Project Description")
+        bot.send_message(
+            chat_id,
+            "✅ توضیحات پروژه با موفقیت به‌روزرسانی شد.",
+            reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت به تنظیمات پروژه", callback_data="menu_manage_project")),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ خطا در ویرایش توضیحات: {e}")
+
+
+def process_uh_manual_section(message):
+    chat_id = message.chat.id
+    st = bot_state.get(chat_id)
+    if not st or st.get('type') != 'uh_shortage' or not message.text:
+        return
+    sec = message.text.strip()
+    log_message(chat_id, sec, "process_uh_manual_section")
+    st['section'] = sec
+    msg = bot.send_message(chat_id, f"🗂 بخش: **{sec}**\n\nتعداد نیروی مورد نیاز را وارد فرمایید (مثلاً: `2`):", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_uh_shortage_count)
+
+
+def process_uh_shortage_count(message):
+    chat_id = message.chat.id
+    st = bot_state.get(chat_id)
+    if not st or st.get('type') != 'uh_shortage' or not message.text:
+        return
+    norm_txt = normalize_input_digits(message.text.strip())
+    log_message(chat_id, norm_txt, "process_uh_shortage_count")
+    if not norm_txt.isdigit() or int(norm_txt) <= 0:
+        msg = bot.send_message(chat_id, "❌ لطفاً تعداد را فقط به صورت عدد صحیح مثبت وارد فرمایید:")
+        bot.register_next_step_handler(msg, process_uh_shortage_count)
+        return
+    st['count'] = int(norm_txt)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👩🏻 خانم", callback_data="uh_grp_خانم"),
+        types.InlineKeyboardButton("👨🏻 آقا", callback_data="uh_grp_آقا"),
+        types.InlineKeyboardButton("👥 فرقی ندارد (عمومی)", callback_data="uh_grp_عمومی")
+    )
+    bot.send_message(chat_id, "جنسیت نیروی مورد نیاز را انتخاب فرمایید:", reply_markup=markup)
+
+
+def process_uh_shortage_desc(message):
+    chat_id = message.chat.id
+    st = bot_state.get(chat_id)
+    if not st or st.get('type') != 'uh_shortage' or not message.text:
+        return
+    desc = message.text.strip()
+    log_message(chat_id, desc, "process_uh_shortage_desc")
+    pid = st['pid']
+    unit = st['unit']
+    sec = st.get('section', 'اصلی')
+    cnt = st.get('count', 1)
+    grp = st.get('target_group', 'عمومی')
+
+    sh_id = shortage_manager.add_unit_head_shortage(pid, unit, sec, cnt, grp, desc, requested_by=chat_id)
+    log_action(chat_id, pid, "Unit Head Request Shortage", f"Unit: {unit}, Sec: {sec}, Count: {cnt}")
+
+    bot.send_message(
+        chat_id,
+        f"✅ درخواست کمبود **{cnt} نفر** برای واحد **{unit}** (بخش {sec}) ثبت شد و جهت تایید برای مدیر پروژه ارسال گردید.",
+        reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")),
+        parse_mode="Markdown"
+    )
+
+    if sh_id:
+        proj = project_manager.get_project(pid)
+        pname = proj['name'] if proj else ""
+        u_info = permission_manager.get_user(chat_id)
+        uh_name = u_info['staff_name'] if u_info else f"مسئول واحد {unit}"
+        admin_text = (
+            f"📢 **درخواست ثبت کمبود نیرو از طرف مسئول واحد**\n\n"
+            f"🏢 پروژه: **{pname}**\n"
+            f"👤 درخواست‌دهنده: **{uh_name}**\n"
+            f"📍 واحد: **{unit}** | بخش: **{sec}**\n"
+            f"👥 تعداد درخواستی: **{cnt} نفر** ({grp})\n"
+            f"📝 توضیحات: {desc}\n\n"
+            f"آیا با اعلام عمومی این کمبود موافقید؟"
+        )
+        adm_markup = types.InlineKeyboardMarkup(row_width=2)
+        adm_markup.add(
+            types.InlineKeyboardButton("✅ تایید و اعلام عمومی", callback_data=f"appr_uh_shrt_{sh_id}_{chat_id}"),
+            types.InlineKeyboardButton("❌ رد و حذف درخواست", callback_data=f"rej_uh_shrt_{sh_id}_{chat_id}"),
+            types.InlineKeyboardButton("✏️ ویرایش تعداد", callback_data=f"edit_uh_count_{sh_id}_{chat_id}")
+        )
+        admins = permission_manager.get_project_admins(pid, include_global=True)
+        for adm in admins:
+            try:
+                bot.send_message(adm['user_id'], admin_text, reply_markup=adm_markup, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    bot_state.pop(chat_id, None)
+
+
+def process_admin_edit_uh_count(message, sh_id, uh_id):
+    chat_id = message.chat.id
+    if not message.text:
+        return
+    norm_txt = normalize_input_digits(message.text.strip())
+    if not norm_txt.isdigit() or int(norm_txt) <= 0:
+        msg = bot.send_message(chat_id, "❌ لطفاً یک عدد صحیح معتبر وارد فرمایید:")
+        bot.register_next_step_handler(msg, process_admin_edit_uh_count, sh_id, uh_id)
+        return
+    new_cnt = int(norm_txt)
+    shortage_manager.update_shortage_count(sh_id, new_cnt)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ تایید و برودکست با تعداد جدید", callback_data=f"appr_uh_shrt_{sh_id}_{uh_id}"),
+        types.InlineKeyboardButton("❌ رد و حذف درخواست", callback_data=f"rej_uh_shrt_{sh_id}_{uh_id}")
+    )
+    bot.send_message(chat_id, f"✅ تعداد کمبود به **{new_cnt} نفر** تغییر یافت. اکنون تعیین وضعیت فرمایید:", reply_markup=markup, parse_mode="Markdown")
+
+
+def process_proj_add_uh_uid(message):
+    chat_id = message.chat.id
+    st = bot_state.get(chat_id)
+    if not st or st.get('type') != 'add_project_uh' or not message.text:
+        return
+    norm_txt = normalize_input_digits(message.text.strip())
+    log_message(chat_id, norm_txt, "process_proj_add_uh_uid")
+    if not norm_txt.isdigit():
+        msg = bot.send_message(chat_id, "❌ لطفاً شناسه عددی (Chat ID) را فقط به صورت عدد ارسال فرمایید:")
+        bot.register_next_step_handler(msg, process_proj_add_uh_uid)
+        return
+    t_uid = int(norm_txt)
+    st['uid'] = t_uid
+    existing_u = permission_manager.get_user(t_uid)
+    if existing_u:
+        st['staff_name'] = existing_u.get('staff_name') or f"کاربر {t_uid}"
+        st['gender'] = existing_u.get('gender', 'خانم')
+        ask_proj_uh_unit(chat_id, st['pid'], st['staff_name'])
+    else:
+        msg = bot.send_message(chat_id, f"شناسه: `{t_uid}`\n\nلطفاً **نام و نام خانوادگی** مسئول واحد را ارسال فرمایید:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_proj_add_uh_name)
+
+
+def process_proj_add_uh_name(message):
+    chat_id = message.chat.id
+    st = bot_state.get(chat_id)
+    if not st or st.get('type') != 'add_project_uh' or not message.text:
+        return
+    name = message.text.strip()
+    log_message(chat_id, name, "process_proj_add_uh_name")
+    st['staff_name'] = name
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👩🏻 خانم", callback_data="proj_uh_gen_خانم"),
+        types.InlineKeyboardButton("👨🏻 آقا", callback_data="proj_uh_gen_آقا")
+    )
+    bot.send_message(chat_id, f"مسئول واحد: **{name}**\n\nلطفاً جنسیت ایشان را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
+
+
+def ask_proj_uh_unit(chat_id, pid, staff_name):
+    chart = project_manager.get_project_org_chart(pid)
+    units = sorted(list(chart.keys()))
+    if not units:
+        all_s = staff_manager.list_staff(pid)
+        units = sorted(list(set(s['unit'] for s in all_s if s.get('unit'))))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for u in units:
+        markup.add(types.InlineKeyboardButton(f"🏢 {u}", callback_data=f"proj_uh_setunit_{u}"))
+    markup.add(types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_permissions"))
+    bot.send_message(chat_id, f"مسئول واحد: **{staff_name}**\n\nلطفاً واحد تحت مسئولیت ایشان در این پروژه را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
+
+
 def process_guser_rename(message, target_uid):
     chat_id = message.chat.id
+    if not message.text: return
     new_name = message.text.strip()
     permission_manager.update_staff_name(target_uid, new_name)
     bot.send_message(
-        chat_id, 
+        chat_id,
         f"✅ نام کاربر با موفقیت به «{new_name}» تغییر یافت.",
         reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 بازگشت به پروفایل", callback_data=f"hr_view_{target_uid}"))
     )
 
+
 def process_wiz_project_name(message):
     chat_id = message.chat.id
+    if not message.text: return
     name = message.text.strip()
     log_message(chat_id, name, "process_wiz_project_name")
     bot_state[chat_id] = {'name': name}
@@ -1700,18 +2288,41 @@ def process_wiz_project_name(message):
     )
     bot.send_message(chat_id, f"نام پروژه: **{name}**\n\n**مرحله ۲:** لطفاً **نوع پروژه** را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
 
+
 def process_wiz_class_time(message):
     chat_id = message.chat.id
+    if not message.text: return
     if chat_id not in bot_state: bot_state[chat_id] = {}
-    ctime = message.text.strip()
+    ctime = normalize_input_digits(message.text.strip())
     log_message(chat_id, ctime, "process_wiz_class_time")
-    
-    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', ctime):
-        msg = bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً دقیقاً مانند `16:00` یا `08:30` ارسال فرمایید:", parse_mode="Markdown")
+
+    if not re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', ctime):
+        msg = bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً دقیقاً مانند `15:00` یا `08:30` ارسال فرمایید:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, process_wiz_class_time)
         return
+    parts = ctime.split(":")
+    ctime = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
     bot_state[chat_id]['activation_time'] = ctime
-    
+
+    msg = bot.send_message(chat_id, f"⏰ ساعت شروع: **{ctime}**\n\n**مرحله ۵:** لطفاً **ساعت پایان فعالیت کلاس** را با فرمت `HH:MM` وارد فرمایید (مثلاً `20:00`):", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_wiz_class_end_time)
+
+
+def process_wiz_class_end_time(message):
+    chat_id = message.chat.id
+    if not message.text: return
+    if chat_id not in bot_state: bot_state[chat_id] = {}
+    etime = normalize_input_digits(message.text.strip())
+    log_message(chat_id, etime, "process_wiz_class_end_time")
+
+    if not re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', etime):
+        msg = bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً مانند `20:00` ارسال فرمایید:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_wiz_class_end_time)
+        return
+    parts = etime.split(":")
+    etime = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    bot_state[chat_id]['end_time'] = etime
+
     markup = types.InlineKeyboardMarkup(row_width=3)
     markup.add(
         types.InlineKeyboardButton("۴ جلسه", callback_data="wiz_cnt_4"),
@@ -1721,13 +2332,15 @@ def process_wiz_class_time(message):
         types.InlineKeyboardButton("۱۶ جلسه", callback_data="wiz_cnt_16"),
         types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_switch_project")
     )
-    msg = bot.send_message(chat_id, f"⏰ ساعت شروع: **{ctime}**\n\n**مرحله ۵:** لطفاً **تعداد جلسات کلاس** را انتخاب یا عدد آن را تایپ فرمایید:", reply_markup=markup, parse_mode="Markdown")
+    msg = bot.send_message(chat_id, f"⏰ بازه ساعت کلاس: **{bot_state[chat_id].get('activation_time')} تا {etime}**\n\n**مرحله ۶:** لطفاً **تعداد جلسات کلاس** را انتخاب یا عدد آن را تایپ فرمایید:", reply_markup=markup, parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_wiz_class_count_text)
+
 
 def process_wiz_class_count_text(message):
     chat_id = message.chat.id
+    if not message.text: return
     if chat_id not in bot_state: bot_state[chat_id] = {}
-    txt = message.text.strip()
+    txt = normalize_input_digits(message.text.strip())
     log_message(chat_id, txt, "process_wiz_class_count_text")
     try:
         cnt = int(txt)
@@ -1737,13 +2350,16 @@ def process_wiz_class_count_text(message):
         msg = bot.send_message(chat_id, "❌ لطفاً تعداد جلسات را فقط به صورت عدد (مثلاً `10`) ارسال فرمایید:")
         bot.register_next_step_handler(msg, process_wiz_class_count_text)
 
+
 def process_wiz_start_date_text(message):
     chat_id = message.chat.id
+    if not message.text: return
     if chat_id not in bot_state: bot_state[chat_id] = {}
-    txt = message.text.strip()
+    txt = normalize_date_to_jalali(normalize_input_digits(message.text.strip()))
     log_message(chat_id, txt, "process_wiz_start_date_text")
     bot_state[chat_id]['start_date'] = txt
     ask_wiz_end_date(chat_id, txt)
+
 
 def ask_wiz_end_date(chat_id, start_date):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1751,26 +2367,63 @@ def ask_wiz_end_date(chat_id, start_date):
         types.InlineKeyboardButton("همان روز (۱ روزه)", callback_data="wiz_end_sameday"),
         types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_switch_project")
     )
-    msg = bot.send_message(chat_id, f"📅 تاریخ شروع: **{start_date}**\n\n**مرحله ۴:** لطفاً **تاریخ پایان رویداد** را وارد فرمایید:\n(یا اگر رویداد ۱ روزه است، دکمه «همان روز» را لمس فرمایید)", reply_markup=markup, parse_mode="Markdown")
+    msg = bot.send_message(chat_id, f"📅 تاریخ شروع (شمسی): **{start_date}**\n\n**مرحله ۴:** لطفاً **تاریخ پایان رویداد (شمسی)** را وارد فرمایید:\n(یا اگر رویداد ۱ روزه است، دکمه «همان روز» را لمس فرمایید)", reply_markup=markup, parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_wiz_end_date_text)
+
 
 def process_wiz_end_date_text(message):
     chat_id = message.chat.id
+    if not message.text: return
     if chat_id not in bot_state: bot_state[chat_id] = {}
-    txt = message.text.strip()
+    txt = normalize_date_to_jalali(normalize_input_digits(message.text.strip()))
     log_message(chat_id, txt, "process_wiz_end_date_text")
     bot_state[chat_id]['end_date'] = txt
     bot_state[chat_id]['total_sessions'] = 2
+    ask_wiz_event_hours(chat_id)
+
+
+def ask_wiz_event_hours(chat_id):
+    msg = bot.send_message(
+        chat_id,
+        "⏰ **مرحله ۵:** لطفاً **بازه ساعت فعالیت روزانه این پروژه** را با فرمت `HH:MM-HH:MM` ارسال فرمایید:\n(مثلاً `07:30-21:00` یا فقط ساعت شروع مثل `08:00`)",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, process_wiz_event_hours_text)
+
+
+def process_wiz_event_hours_text(message):
+    chat_id = message.chat.id
+    if not message.text: return
+    if chat_id not in bot_state: bot_state[chat_id] = {}
+    txt = normalize_input_digits(message.text.strip())
+    log_message(chat_id, txt, "process_wiz_event_hours_text")
+
+    m_range = re.match(r'^(\d{1,2}:\d{2})\s*[-تاto]+\s*(\d{1,2}:\d{2})$', txt)
+    m_single = re.match(r'^(\d{1,2}:\d{2})$', txt)
+    if m_range:
+        s_p = m_range.group(1).split(":")
+        e_p = m_range.group(2).split(":")
+        bot_state[chat_id]['activation_time'] = f"{int(s_p[0]):02d}:{int(s_p[1]):02d}"
+        bot_state[chat_id]['end_time'] = f"{int(e_p[0]):02d}:{int(e_p[1]):02d}"
+    elif m_single:
+        s_p = m_single.group(1).split(":")
+        bot_state[chat_id]['activation_time'] = f"{int(s_p[0]):02d}:{int(s_p[1]):02d}"
+        bot_state[chat_id]['end_time'] = "23:00"
+    else:
+        bot_state[chat_id]['activation_time'] = "07:00"
+        bot_state[chat_id]['end_time'] = "23:00"
+
     ask_wiz_prep_day(chat_id)
 
+
 def ask_wiz_prep_day(chat_id):
-    st = bot_state.get(chat_id, {})
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("✅ بله، دارد", callback_data="wiz_prep_1"),
         types.InlineKeyboardButton("❌ خیر، ندارد", callback_data="wiz_prep_0")
     )
-    bot.send_message(chat_id, f"🛠 **آیا این پروژه نیاز به «روز آماده‌سازی» دارد؟**\n\nدر صورت انتخاب «بله»، شیت و جلسه اختصاصی `روز آماده سازی` به طور خودکار قبل از روزهای اصلی رویداد تعریف خواهد شد.", reply_markup=markup, parse_mode="Markdown")
+    bot.send_message(chat_id, "🛠 **آیا این پروژه نیاز به «روز آماده‌سازی» دارد؟**\n\nدر صورت انتخاب «بله»، شیت و جلسه اختصاصی `روز آماده سازی` با تاریخ شمسی یک روز قبل از شروع رویداد تعریف خواهد شد.", reply_markup=markup, parse_mode="Markdown")
+
 
 def finalize_smart_project_creation(chat_id):
     st = bot_state.get(chat_id, {})
@@ -1778,7 +2431,8 @@ def finalize_smart_project_creation(chat_id):
     ptype = st.get('project_type', 'عمومی')
     tot_sess = st.get('total_sessions', 1)
     rec_days = st.get('recurring_days', '')
-    act_time = st.get('activation_time', '')
+    act_time = st.get('activation_time', '07:00')
+    end_time = st.get('end_time', '23:00')
     sdate = st.get('start_date', '')
     edate = st.get('end_date', '')
     has_prep = st.get('has_prep_day', False)
@@ -1787,29 +2441,32 @@ def finalize_smart_project_creation(chat_id):
     try:
         new_pid, first_sid = project_manager.create_project_with_smart_sessions(
             name=name, project_type=ptype,
-            total_sessions=tot_sess, recurring_days=rec_days, activation_time=act_time,
+            total_sessions=tot_sess, recurring_days=rec_days,
+            activation_time=act_time, end_time=end_time,
             start_date=sdate, end_date=edate, has_prep_day=has_prep
         )
         permission_manager.set_project_user(new_pid, chat_id, role="super_admin", is_active=1)
         permission_manager.set_user_context(chat_id, project_id=new_pid, session_id=first_sid)
 
         sessions = attendance_manager.list_sessions(new_pid)
-        sess_names = "، ".join([s['name'] for s in sessions])
+        sess_names = "، ".join([f"{s['name']} ({s.get('session_date') or ''})" for s in sessions])
+        proj_created = project_manager.get_project(new_pid)
 
         summary_text = (
             f"✅ **پروژه جدید با موفقیت ایجاد گردید!**\n\n"
             f"🏢 نام پروژه: **{name}**\n"
             f"🏷 نوع: **{ptype}**\n"
+            f"📅 بازه تاریخ شمسی: از `{proj_created.get('start_date')}` تا `{proj_created.get('end_date')}`\n"
+            f"⏰ ساعت فعالیت روزانه: از `{act_time}` تا `{end_time}`\n"
         )
         if ptype == 'کلاس':
-            summary_text += f"🗓 روز برگزاری: **{rec_days}** (ساعت: `{act_time}`)\n"
+            summary_text += f"🗓 روز برگزاری: **{rec_days}**\n"
             summary_text += f"🔢 تعداد جلسات ایجاد شده: **{len(sessions)} جلسه**\n"
         else:
-            summary_text += f"📅 بازه زمانی: از **{sdate or 'نامشخص'}** تا **{edate or 'نامشخص'}**\n"
             summary_text += f"🛠 روز آماده‌سازی: **{'دارد' if has_prep else 'ندارد'}**\n"
-            summary_text += f"📋 روزها و جلسات ایجاد شده: **{sess_names}**\n"
+            summary_text += f"📋 جلسات ایجاد شده: **{sess_names}**\n"
 
-        summary_text += "\nشما به عنوان مدیر ارشد این پروژه تنظیم شدید و جلسه اولیه فعال گردید."
+        summary_text += "\nشما به عنوان مدیر ارشد این پروژه تنظیم شدید و جلسات بر اساس تقویم شمسی روز به طور خودکار فعال خواهند شد."
         bot.send_message(chat_id, summary_text, parse_mode="Markdown")
 
         if chat_id in bot_state: del bot_state[chat_id]
@@ -1821,14 +2478,14 @@ def finalize_smart_project_creation(chat_id):
         bot.send_message(chat_id, f"❌ خطا در ایجاد هوشمند پروژه: {e}",
                          reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu_switch_project")))
 
+
 def process_global_add_user_id(message):
     chat_id = message.chat.id
     state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'global_add_user': return
+    if not state or state.get('type') != 'global_add_user' or not message.text: return
     txt = message.text.strip()
     log_message(chat_id, txt, "process_global_add_user_id")
-    from utils import normalize_persian
-    norm_txt = normalize_persian(txt)
+    norm_txt = normalize_input_digits(txt)
     if not norm_txt.isdigit():
         msg = bot.send_message(chat_id, "❌ لطفاً شناسه عددی (Chat ID) را فقط به صورت عدد ارسال فرمایید:")
         bot.register_next_step_handler(msg, process_global_add_user_id)
@@ -1838,10 +2495,11 @@ def process_global_add_user_id(message):
     msg = bot.send_message(chat_id, f"شناسه عددی: `{t_uid}`\n\n**مرحله ۲:** لطفاً **نام و نام خانوادگی** نیرو را ارسال فرمایید:", parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_global_add_user_name)
 
+
 def process_global_add_user_name(message):
     chat_id = message.chat.id
     state = bot_state.get(chat_id)
-    if not state or state.get('type') != 'global_add_user': return
+    if not state or state.get('type') != 'global_add_user' or not message.text: return
     name = message.text.strip()
     log_message(chat_id, name, "process_global_add_user_name")
     state['name'] = name
@@ -1851,6 +2509,7 @@ def process_global_add_user_name(message):
         types.InlineKeyboardButton("👨🏻 آقا", callback_data="guser_gen_آقا")
     )
     bot.send_message(chat_id, f"نیرو: **{name}**\n\n**مرحله ۳:** لطفاً **جنسیت** نیرو را مشخص فرمایید:\n_(تعیین‌کننده تفکیک دسترسی اپراتورها به لیست خواهران یا برادران)_", reply_markup=markup, parse_mode="Markdown")
+
 
 def show_user_profile(chat_id, project_id, session_id, staff_id, message_id=None):
     rec = attendance_manager.get_staff_session_attendance(project_id, session_id, staff_id)
@@ -1893,6 +2552,8 @@ def show_user_profile(chat_id, project_id, session_id, staff_id, message_id=None
         )
 
     markup.add(types.InlineKeyboardButton("📝 ویرایش توضیحات", callback_data=f"editdesc_{staff_id}"))
+    if chat_id in search_queries and search_queries[chat_id]:
+        markup.add(types.InlineKeyboardButton("🔙 بازگشت به نتایج جستجو", callback_data="sp_0"))
     markup.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
 
     if TELEBOT_AVAILABLE and bot:
@@ -1902,6 +2563,7 @@ def show_user_profile(chat_id, project_id, session_id, staff_id, message_id=None
                 return
             except Exception: pass
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
 
 def render_unit_page(chat_id, project_id, session_id, unit, page, message_id=None):
     all_att = attendance_manager.get_session_attendance(project_id, session_id)
@@ -1928,13 +2590,11 @@ def render_unit_page(chat_id, project_id, session_id, unit, page, message_id=Non
     if TELEBOT_AVAILABLE and bot:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
 
-def process_search(message, project_id, session_id):
-    chat_id = message.chat.id
-    q = message.text.strip()
-    log_message(chat_id, q, "process_search")
+
+def render_search_page(chat_id, project_id, session_id, query_str, page=0, message_id=None):
     all_att = attendance_manager.get_session_attendance(project_id, session_id)
     filtered = permission_manager.apply_gender_filter(all_att, chat_id, project_id)
-    clean_q = normalize_persian(q)
+    clean_q = normalize_persian(query_str)
     results = []
     for s in filtered:
         if (clean_q in normalize_persian(s.get('name', '')) or
@@ -1945,20 +2605,60 @@ def process_search(message, project_id, session_id):
             results.append(s)
 
     if not results:
-        bot.send_message(chat_id, "❌ هیچ فردی با مشخصات وارد شده یافت نشد.",
-                         reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔍 جستجوی مجدد", callback_data="menu_search"), types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")))
+        markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("🔍 جستجوی مجدد", callback_data="menu_search"),
+            types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")
+        )
+        msg_txt = "❌ هیچ فردی با مشخصات وارد شده یافت نشد."
+        if message_id:
+            bot.edit_message_text(msg_txt, chat_id, message_id, reply_markup=markup)
+        else:
+            bot.send_message(chat_id, msg_txt, reply_markup=markup)
         return
 
+    items_per_page = 8
+    total_pages = max(1, (len(results) - 1) // items_per_page + 1)
+    page = max(0, min(page, total_pages - 1))
+    current_items = results[page * items_per_page:(page + 1) * items_per_page]
+
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for s in results[:10]:
+    for s in current_items:
         emojis = get_user_emojis(s.get('status'), s.get('card_status'))
         markup.add(types.InlineKeyboardButton(f"👤 {s['name']} ({s.get('section', '-')}) | {emojis}", callback_data=f"user_{s['staff_id']}"))
 
-    markup.add(types.InlineKeyboardButton("🔍 جستجوی مجدد", callback_data="menu_search"), types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu"))
-    bot.send_message(chat_id, f"🔍 **{len(results)} نتیجه یافت شد:**", reply_markup=markup, parse_mode="Markdown")
+    nav_btns = []
+    if page > 0:
+        nav_btns.append(types.InlineKeyboardButton("◀️ قبلی", callback_data=f"sp_{page-1}"))
+    if page < total_pages - 1:
+        nav_btns.append(types.InlineKeyboardButton("بعدی ▶️", callback_data=f"sp_{page+1}"))
+    if nav_btns:
+        markup.add(*nav_btns)
+
+    markup.add(
+        types.InlineKeyboardButton("🔍 جستجوی مجدد", callback_data="menu_search"),
+        types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")
+    )
+
+    text = f"🔍 **{len(results)} نتیجه برای «{safe_markdown(query_str)}» یافت شد:**\n📄 صفحه {page+1} از {total_pages}"
+    if TELEBOT_AVAILABLE and bot:
+        if message_id:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
+
+def process_search(message, project_id, session_id):
+    chat_id = message.chat.id
+    if not message.text: return
+    q = message.text.strip()
+    log_message(chat_id, q, "process_search")
+    search_queries[chat_id] = q
+    render_search_page(chat_id, project_id, session_id, q, page=0)
+
 
 def process_track_late(message):
     chat_id = message.chat.id
+    if not message.text: return
     log_message(chat_id, message.text, "process_track_late")
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'track_late': return
@@ -1973,8 +2673,10 @@ def process_track_late(message):
     show_user_profile(chat_id, pid, sid, staff_id)
     del bot_state[chat_id]
 
+
 def process_edit_desc(message):
     chat_id = message.chat.id
+    if not message.text: return
     log_message(chat_id, message.text, "process_edit_desc")
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'edit_desc': return
@@ -1988,24 +2690,28 @@ def process_edit_desc(message):
     show_user_profile(chat_id, pid, sid, staff_id)
     del bot_state[chat_id]
 
+
 def show_session_details(chat_id, project_id, session_id, message_id=None):
     sess = attendance_manager.get_session(session_id)
     if not sess:
         if TELEBOT_AVAILABLE and bot: bot.send_message(chat_id, "❌ جلسه یافت نشد.")
         return
 
+    proj = project_manager.get_project(project_id)
     is_canc = sess.get('status') == 'CANCELLED'
-    status_fa = "❌ لغوشده (در حضور و غیاب محاسبه نمی‌شود)" if is_canc else "🟢 فعال در جریان کاری"
+    status_fa = "❌ لغوشده (در حضور و غیاب و نوتیف‌ها محاسبه نمی‌شود)" if is_canc else "🟢 فعال در تقویم کاری"
     date_fa = sess.get('session_date') or "تعیین نشده"
-    time_fa = sess.get('time_str') or "تعیین نشده"
+    time_fa = sess.get('time_str') or (proj.get('activation_time') if proj else '') or "07:00"
+    etime_fa = sess.get('end_time_str') or (proj.get('end_time') if proj else '') or "23:00"
     day_fa = sess.get('day_of_week') or "تعیین نشده"
 
     sname_safe = safe_markdown(sess['name'])
     text = (
         f"🗓 **جزییات و ویرایش جلسه: {sname_safe}**\n\n"
         f"🏷 نام جلسه: **{sname_safe}**\n"
-        f"📅 تاریخ: `{date_fa}`\n"
-        f"⏰ ساعت شروع: `{time_fa}`\n"
+        f"📅 تاریخ شمسی: `{date_fa}`\n"
+        f"⏰ ساعت شروع فعالیت: `{time_fa}`\n"
+        f"⏰ ساعت پایان فعالیت: `{etime_fa}`\n"
         f"🗓 روز هفته: **{safe_markdown(day_fa)}**\n"
         f"📊 وضعیت: **{status_fa}**\n\n"
         f"جهت ویرایش هر بخش، گزینه مورد نظر را انتخاب فرمایید:"
@@ -2013,8 +2719,9 @@ def show_session_details(chat_id, project_id, session_id, message_id=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("✏️ ویرایش نام", callback_data=f"editsess_name_{session_id}"),
-        types.InlineKeyboardButton("📅 ویرایش تاریخ", callback_data=f"editsess_date_{session_id}"),
-        types.InlineKeyboardButton("⏰ ویرایش ساعت", callback_data=f"editsess_time_{session_id}"),
+        types.InlineKeyboardButton("📅 ویرایش تاریخ شمسی", callback_data=f"editsess_date_{session_id}"),
+        types.InlineKeyboardButton("⏰ ویرایش ساعت شروع", callback_data=f"editsess_time_{session_id}"),
+        types.InlineKeyboardButton("⏰ ویرایش ساعت پایان", callback_data=f"editsess_etime_{session_id}"),
         types.InlineKeyboardButton("🗓 ویرایش روز هفته", callback_data=f"editsess_day_{session_id}")
     )
     toggle_txt = "🟢 فعال‌سازی مجدد جلسه" if is_canc else "❌ لغو این جلسه (تعطیلی)"
@@ -2028,44 +2735,68 @@ def show_session_details(chat_id, project_id, session_id, message_id=None):
             try:
                 bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
                 return
-            except Exception:
-                try:
-                    bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
-                    return
-                except Exception:
-                    try:
-                        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
-                        return
-                    except Exception:
-                        pass
+            except Exception: pass
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+
 
 def process_edit_session_field(message, session_id, field_name):
     chat_id = message.chat.id
-    val = message.text.strip()
+    if not message.text: return
+    val = normalize_input_digits(message.text.strip())
     log_message(chat_id, val, f"process_edit_session_field_{field_name}")
     pid, _ = get_user_active_project_and_session(chat_id)
-    attendance_manager.update_session_field(session_id, field_name, val)
-    log_action(chat_id, pid, f"Edit Session {field_name}", f"ID: {session_id}, Val: {val}")
-    bot.send_message(chat_id, "✅ مقدار جدید با موفقیت ذخیره شد.")
+    try:
+        if field_name in ("time_str", "end_time_str") and val:
+            if not re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', val):
+                bot.send_message(chat_id, "❌ فرمت ساعت نامعتبر است. لطفاً مانند `08:00` یا `20:00` وارد کنید.")
+                show_session_details(chat_id, pid, session_id)
+                return
+            p = val.split(":")
+            val = f"{int(p[0]):02d}:{int(p[1]):02d}"
+
+        attendance_manager.update_session_field(session_id, field_name, val)
+        log_action(chat_id, pid, f"Edit Session {field_name}", f"ID: {session_id}, Val: {val}")
+        bot.send_message(chat_id, "✅ مقدار جدید با موفقیت ذخیره شد.")
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ {e}")
     show_session_details(chat_id, pid, session_id)
+
 
 def process_add_session_name(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_session': return
     pid = state['pid']
     name = message.text.strip()
     log_message(chat_id, name, "process_add_session_name")
-    sid = attendance_manager.create_session(pid, name)
+
+    schedules = attendance_manager.list_schedules(pid, active_only=True)
+    sched_id = schedules[0]['id'] if len(schedules) == 1 else None
+    today_j = get_today_jalali_str()
+    proj = project_manager.get_project(pid)
+    s_time = proj.get('activation_time', '07:00') if proj else '07:00'
+    e_time = proj.get('end_time', '23:00') if proj else '23:00'
+
+    sid = attendance_manager.create_session(
+        pid, name, session_date=today_j,
+        time_str=s_time, end_time_str=e_time,
+        day_of_week=get_persian_weekday(), schedule_id=sched_id
+    )
+    project_manager.set_project_active_session(pid, sid, is_manual=True)
     permission_manager.set_user_context(chat_id, project_id=pid, session_id=sid)
     log_action(chat_id, pid, "Create Session", f"Session: {name} (ID: {sid})")
-    bot.send_message(chat_id, f"✅ جلسه «{name}» ایجاد و فعال شد.",
-                     reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")))
+    bot.send_message(chat_id, f"✅ جلسه «{name}» با تاریخ شمسی `{today_j}` ایجاد و فعال شد.",
+                     reply_markup=types.InlineKeyboardMarkup().add(
+                         types.InlineKeyboardButton("🗓 ویرایش تاریخ/ساعت جلسه", callback_data=f"sess_detail_{sid}"),
+                         types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")
+                     ), parse_mode="Markdown")
     del bot_state[chat_id]
+
 
 def process_add_staff_name(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_staff': return
     name = message.text.strip()
@@ -2082,8 +2813,10 @@ def process_add_staff_name(message):
     markup.add(types.InlineKeyboardButton("🔙 بازگشت", callback_data="start_menu"))
     bot.send_message(chat_id, f"نیرو: **{name}**\n\n**مرحله ۲:** واحد مربوطه را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
 
+
 def process_add_staff_phone(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_staff': return
     phone = message.text.strip()
@@ -2094,20 +2827,30 @@ def process_add_staff_phone(message):
                types.InlineKeyboardButton("👩🏻 خانم", callback_data="addu_gen_خانم"))
     bot.send_message(chat_id, "**مرحله ۵:** جنسیت نیرو را مشخص فرمایید:", reply_markup=markup)
 
+
 def finalize_add_staff(chat_id, gender):
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_staff': return
     pid = state['pid']; sid = state['sid']
-    staff_id = staff_manager.add_staff_member(pid, state['name'], state['phone'], state['unit'], state['section'], gender=gender, notes="حین پروژه اضافه شده")
-    attendance_manager.add_staff_to_session_roster(pid, sid, [staff_id])
-    attendance_manager.update_attendance_status(pid, sid, staff_id, "حاضر")
+    sess = attendance_manager.get_session(sid) if sid else None
+    sched_id = sess.get('schedule_id') if sess else None
+
+    staff_id = staff_manager.add_staff_member(
+        pid, state['name'], state['phone'], state['unit'], state['section'],
+        gender=gender, notes="حین پروژه اضافه شده", schedule_id=sched_id
+    )
+    if sid:
+        attendance_manager.add_staff_to_session_roster(pid, sid, [staff_id])
+        attendance_manager.update_attendance_status(pid, sid, staff_id, "حاضر")
     log_action(chat_id, pid, "Add Staff", f"Name: {state['name']}, Unit: {state['unit']}, Sec: {state['section']}")
-    bot.send_message(chat_id, f"✅ نیروی جدید با موفقیت ثبت شد و حضور ایشان برای جلسه فعال گردید.",
+    bot.send_message(chat_id, "✅ نیروی جدید با موفقیت ثبت شد و حضور ایشان برای جلسه فعال گردید.",
                      reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")))
     del bot_state[chat_id]
 
+
 def process_suggest_shrt_name(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'suggest_shrt': return
     state['candidate_name'] = message.text.strip()
@@ -2115,8 +2858,10 @@ def process_suggest_shrt_name(message):
     msg = bot.send_message(chat_id, "شماره تماس نیروی پیشنهادی را ارسال فرمایید:")
     bot.register_next_step_handler(msg, process_suggest_shrt_phone)
 
+
 def process_suggest_shrt_phone(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'suggest_shrt': return
     phone = message.text.strip()
@@ -2126,7 +2871,7 @@ def process_suggest_shrt_phone(message):
     shortage_manager.suggest_shortage(sh_id, name, phone)
     log_action(chat_id, None, "Suggest Shortage Candidate", f"ShortageID: {sh_id}, Candidate: {name}, Phone: {phone}")
 
-    bot.send_message(chat_id, f"✅ مشخصات نیروی پیشنهادی ثبت شد و برای ادمین‌های پروژه ارسال گردید.",
+    bot.send_message(chat_id, "✅ مشخصات نیروی پیشنهادی ثبت شد و برای ادمین‌های پروژه ارسال گردید.",
                      reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")))
 
     sh = shortage_manager.get_shortage(sh_id)
@@ -2149,7 +2894,8 @@ def process_suggest_shrt_phone(message):
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
         admin_markup.add(
             types.InlineKeyboardButton("✅ تایید و جذب به کادر", callback_data=f"apprshrt_{sh_id}_{chat_id}"),
-            types.InlineKeyboardButton("❌ رد پیشنهاد", callback_data=f"rejshrt_{sh_id}_{chat_id}")
+            types.InlineKeyboardButton("❌ رد پیشنهاد", callback_data=f"rejshrt_{sh_id}_{chat_id}"),
+            types.InlineKeyboardButton("🗑 حذف کامل کمبود", callback_data=f"delshrt_{sh_id}")
         )
         members = permission_manager.get_project_members(sh['project_id'])
         for m in members:
@@ -2161,8 +2907,10 @@ def process_suggest_shrt_phone(message):
 
     del bot_state[chat_id]
 
+
 def process_shortage_section(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'create_shortage': return
     state['section'] = message.text.strip()
@@ -2170,13 +2918,15 @@ def process_shortage_section(message):
     msg = bot.send_message(chat_id, "تعداد نیروی مورد نیاز را وارد نمایید (مثلاً: `2`):", parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_shortage_count)
 
+
 def process_shortage_count(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'create_shortage': return
     log_message(chat_id, message.text, "process_shortage_count")
     try:
-        cnt = int(message.text.strip())
+        cnt = int(normalize_input_digits(message.text.strip()))
         state['count'] = cnt
         msg = bot.send_message(chat_id, "توضیحات و ویژگی‌های نیروی مورد نیاز را وارد فرمایید:")
         bot.register_next_step_handler(msg, process_shortage_desc)
@@ -2184,8 +2934,10 @@ def process_shortage_count(message):
         msg = bot.send_message(chat_id, "لطفاً فقط عدد وارد نمایید:")
         bot.register_next_step_handler(msg, process_shortage_count)
 
+
 def process_shortage_desc(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'create_shortage': return
     state['desc'] = message.text.strip()
@@ -2195,17 +2947,21 @@ def process_shortage_desc(message):
                types.InlineKeyboardButton("👩🏻 خانم", callback_data="shrt_grp_خانم"))
     bot.send_message(chat_id, "جنسیت مورد نیاز را انتخاب فرمایید:", reply_markup=markup)
 
+
 def process_group_shift_time(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'group_shift': return
-    new_time = message.text.strip()
+    new_time = normalize_input_digits(message.text.strip())
     log_message(chat_id, new_time, "process_group_shift_time")
-    
-    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', new_time):
+
+    if not re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', new_time):
         msg = bot.send_message(chat_id, "❌ فرمت ساعت اشتباه است. لطفاً مانند `08:30` ارسال فرمایید:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, process_group_shift_time)
         return
+    p = new_time.split(":")
+    new_time = f"{int(p[0]):02d}:{int(p[1]):02d}"
     pid = state['pid']; u = state['unit']; s = state['section']
     staff_manager.update_section_shift_time(pid, u, s, new_time)
     log_action(chat_id, pid, "Group Shift Updated", f"Unit: {u}, Section: {s}, Time: {new_time}")
@@ -2213,14 +2969,15 @@ def process_group_shift_time(message):
                      reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="start_menu")), parse_mode="Markdown")
     del bot_state[chat_id]
 
+
 def process_perm_new_user(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_perm_user': return
     txt = message.text.strip()
     log_message(chat_id, txt, "process_perm_new_user")
-    from utils import normalize_persian
-    norm_txt = normalize_persian(txt)
+    norm_txt = normalize_input_digits(txt)
     if not norm_txt.isdigit():
         msg = bot.send_message(chat_id, "❌ لطفاً شناسه عددی (Chat ID) بله را فقط به صورت عدد وارد فرمایید:")
         bot.register_next_step_handler(msg, process_perm_new_user)
@@ -2237,8 +2994,10 @@ def process_perm_new_user(message):
         msg = bot.send_message(chat_id, f"شناسه عددی: `{t_uid}`\n\n**مرحله ۲:** لطفاً **نام و نام خانوادگی** نیرو را ارسال فرمایید:", parse_mode="Markdown")
         bot.register_next_step_handler(msg, process_perm_new_user_name)
 
+
 def process_perm_new_user_name(message):
     chat_id = message.chat.id
+    if not message.text: return
     state = bot_state.get(chat_id)
     if not state or state.get('type') != 'add_perm_user': return
     name = message.text.strip()
@@ -2251,6 +3010,7 @@ def process_perm_new_user_name(message):
     )
     bot.send_message(chat_id, f"نیرو: **{name}**\n\n**مرحله ۳:** لطفاً **جنسیت** نیرو را مشخص فرمایید:\n_(اپراتورهای خانم فقط کادر خانم و اپراتورهای آقا فقط کادر آقا را مشاهده خواهند کرد)_", reply_markup=markup, parse_mode="Markdown")
 
+
 def ask_perm_role(chat_id, pid, name, gender):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -2260,6 +3020,7 @@ def ask_perm_role(chat_id, pid, name, gender):
         types.InlineKeyboardButton("🔙 انصراف", callback_data="menu_permissions")
     )
     bot.send_message(chat_id, f"نیرو: **{name}** ({gender})\n\n**مرحله ۴:** لطفاً **نقش این نیرو در پروژه** را انتخاب فرمایید:", reply_markup=markup, parse_mode="Markdown")
+
 
 def process_update_excel_file(message, project_id):
     chat_id = message.chat.id
@@ -2300,9 +3061,11 @@ def process_update_excel_file(message, project_id):
         log_error(chat_id, f"Error processing excel upload: {e}", e)
         bot.send_message(chat_id, f"❌ خطا در پردازش فایل: {e}\n(تراکنش لغو شد و اطلاعات قبلی دست‌نخورده باقی ماند)")
 
+
 if TELEBOT_AVAILABLE and bot:
     bot.message_handler(commands=['start'])(send_welcome)
     bot.callback_query_handler(func=lambda call: True)(handle_callbacks)
+
 
 def start_bot():
     if not TELEBOT_AVAILABLE or not bot:
@@ -2311,22 +3074,25 @@ def start_bot():
         return
 
     print("=" * 65)
-    print("🤖 سامانه مدیریت کادر و حضور و غیاب (نسخه جدید چندپروژه‌ای)")
-    print("📋 لاگر پیشرفته (کنسول و فایل logs/bot.log) فعال شد.")
-    print("✅ در حال شروع ورکر‌های پس‌زمینه (یادآوری تأخیر، گزارش شبانه، بکاپ)...")
+    print("🤖 سامانه مدیریت کادر و حضور و غیاب (نسخه نهایی V6 - تقویم شمسی و زمان‌بندی هوشمند)")
+    print(f"📆 تاریخ و ساعت فعلی سرور (به وقت ایران): {get_today_jalali_str()} - {get_iran_now().strftime('%H:%M:%S')}")
+    print("📋 لاگر پیشرفته (کنسول، logs/bot.log و nohup.out) فعال شد.")
+    print("✅ در حال شروع ورکرهای پس‌زمینه (تقویم خودکار، یادآوری تأخیر در ساعت فعالیت، گزارش شبانه، بکاپ)...")
     worker_manager.set_bot(bot)
     worker_manager.start_workers()
     print("🚀 ربات بله با موفقیت آماده به کار شد و در حال شنود پیام‌هاست...")
     print("=" * 65)
 
-    try:
-        bot.infinity_polling(timeout=20, long_polling_timeout=15)
-    except Exception as e:
-        logger.exception(f"Fatal Bot Error: {e}")
-        print(f"❌ خطای ربات: {e}")
+    while True:
+        try:
+            bot.infinity_polling(timeout=25, long_polling_timeout=20, skip_pending=False)
+        except Exception as e:
+            logger.exception(f"Polling loop interrupted, restarting in 5 seconds: {e}")
+            time.sleep(5)
+
 
 if __name__ == '__main__':
     logger.info("==================================================================")
-    logger.info("🚀 ATTENDANCE BOT V2 - RUNNING POLLING WITH FULL SCOPES")
+    logger.info("🚀 ATTENDANCE BOT V6 - RUNNING POLLING WITH SHAMSI CALENDAR & ACTIVE HOURS")
     logger.info("==================================================================")
     start_bot()

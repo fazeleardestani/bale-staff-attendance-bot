@@ -3,7 +3,11 @@ import sys
 import logging
 from datetime import datetime
 from db_manager import db_instance
-from utils import calculate_status_with_delay, format_delay_minutes
+from utils import (
+    calculate_status_with_delay, format_delay_minutes,
+    get_iran_now, get_today_jalali_str, normalize_date_to_jalali,
+    is_same_calendar_day, get_persian_weekday
+)
 from staff_manager import staff_manager
 from permission_manager import permission_manager
 
@@ -12,75 +16,90 @@ class AttendanceManager:
     def __init__(self, db=db_instance):
         self.db = db
 
-    def create_schedule(self, project_id, name, day_of_week, time_str, location=""):
+    def create_schedule(self, project_id, name, day_of_week, time_str, location="", end_time_str=""):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO schedules (project_id, name, day_of_week, time_str, location, is_active)
-        VALUES (%s, %s, %s, %s, %s, TRUE)
-        RETURNING id;
-        """, (project_id, name.strip(), day_of_week.strip(), time_str.strip(), location.strip()))
-        schedule_id = cursor.fetchone()['id']
-        conn.commit()
-        conn.close()
-        return schedule_id
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT INTO schedules (project_id, name, day_of_week, time_str, end_time_str, location, is_active)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+            RETURNING id;
+            """, (project_id, name.strip(), day_of_week.strip(), time_str.strip(), str(end_time_str or '').strip(), location.strip()))
+            schedule_id = cursor.fetchone()['id']
+            conn.commit()
+            return schedule_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list_schedules(self, project_id, active_only=True):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        query = "SELECT * FROM schedules WHERE project_id = %s"
-        if active_only:
-            query += " AND is_active = TRUE"
-        query += " ORDER BY id ASC"
-        cursor.execute(query, (project_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            cursor = conn.cursor()
+            query = "SELECT * FROM schedules WHERE project_id = %s"
+            if active_only:
+                query += " AND is_active = TRUE"
+            query += " ORDER BY id ASC"
+            cursor.execute(query, (project_id,))
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def set_schedule_active(self, schedule_id, is_active):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE schedules SET is_active = %s WHERE id = %s",
-                       (bool(is_active), schedule_id))
-        conn.commit()
-        conn.close()
-        return True
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE schedules SET is_active = %s WHERE id = %s",
+                           (bool(is_active), schedule_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
                        schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True,
-                       return_details=False):
+                       return_details=False, end_time_str=''):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        if schedule_id is not None:
-            cursor.execute(
-                "SELECT id FROM schedules WHERE id = %s AND project_id = %s AND is_active = TRUE", (schedule_id, project_id))
-            if not cursor.fetchone():
-                conn.close()
-                raise ValueError(
-                    f"برنامه با شناسه {schedule_id} متعلق به این پروژه نیست یا فعال نمی‌باشد.")
-
-        now_iso = datetime.now().isoformat()
-        date_str = str(session_date or '').strip()
-
-        if schedule_id is not None and date_str:
-            cursor.execute("""
-            SELECT id FROM sessions 
-            WHERE project_id = %s AND schedule_id = %s AND session_date = %s AND status != 'CANCELLED'
-            """, (project_id, schedule_id, date_str))
-            existing = cursor.fetchone()
-            if existing:
-                conn.close()
-                if return_details:
-                    return existing['id'], False
-                return existing['id']
-
         try:
+            cursor = conn.cursor()
+
+            if schedule_id is not None:
+                cursor.execute(
+                    "SELECT id FROM schedules WHERE id = %s AND project_id = %s AND is_active = TRUE", (schedule_id, project_id))
+                if not cursor.fetchone():
+                    raise ValueError(
+                        f"برنامه با شناسه {schedule_id} متعلق به این پروژه نیست یا فعال نمی‌باشد.")
+
+            now_iso = get_iran_now().isoformat()
+            raw_date_str = str(session_date or '').strip()
+            date_str = normalize_date_to_jalali(raw_date_str) if raw_date_str else ''
+
+            if schedule_id is not None and date_str:
+                cursor.execute("""
+                SELECT id, session_date FROM sessions 
+                WHERE project_id = %s AND schedule_id = %s AND status != 'CANCELLED'
+                """, (project_id, schedule_id))
+                for ex_row in cursor.fetchall():
+                    if is_same_calendar_day(ex_row['session_date'], date_str):
+                        if return_details:
+                            return ex_row['id'], False
+                        return ex_row['id']
+
             cursor.execute("""
-            INSERT INTO sessions (project_id, schedule_id, name, session_date, time_str, day_of_week, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, 'SCHEDULED', %s)
+            INSERT INTO sessions (project_id, schedule_id, name, session_date, time_str, end_time_str, day_of_week, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'SCHEDULED', %s)
             RETURNING id;
-            """, (project_id, schedule_id, name.strip(), date_str, str(time_str or '').strip(), str(day_of_week or '').strip(), now_iso))
+            """, (
+                project_id, schedule_id, name.strip(), date_str,
+                str(time_str or '').strip(), str(end_time_str or '').strip(),
+                str(day_of_week or '').strip(), now_iso
+            ))
             session_id = cursor.fetchone()['id']
 
             if schedule_id is not None:
@@ -145,133 +164,256 @@ class AttendanceManager:
         return session_id
 
     def get_or_create_session(self, project_id, name, session_date=None, time_str='', day_of_week='',
-                              schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True):
+                              schedule_id=None, copy_from_prev_session=True, sync_excel_sheet=True, end_time_str=''):
         return self.create_session(
             project_id, name, session_date=session_date, time_str=time_str,
             day_of_week=day_of_week, schedule_id=schedule_id,
             copy_from_prev_session=copy_from_prev_session,
-            sync_excel_sheet=sync_excel_sheet, return_details=True
+            sync_excel_sheet=sync_excel_sheet, return_details=True, end_time_str=end_time_str
         )
 
-    def get_session(self, session_id):
+    def get_auto_session_for_today(self, project_id, now=None):
+        """
+        پیدا کردن جلسه منطبق با تاریخ شمسی امروز برای یک پروژه.
+        اگر جلسه‌ای دقیقاً با تاریخ امروز وجود داشته باشد، آن را برمی‌گرداند.
+        """
+        if now is None:
+            now = get_iran_now()
+        today_jalali = get_today_jalali_str(now)
+        sessions = self.list_sessions(project_id, include_cancelled=False)
+        for s in sessions:
+            s_date = s.get('session_date')
+            if s_date and is_same_calendar_day(s_date, today_jalali):
+                return s
+        return None
+
+    def resolve_project_active_session_id(self, project_id, now=None):
+        """
+        تعیین هوشمند جلسه فعال پروژه:
+        ۱. اگر مدیر جلسه را به صورت دستی انتخاب و قفل کرده باشد (manual_session_override=True)، همان جلسه برگردانده می‌شود.
+        ۲. در غیر این صورت، اگر جلسه‌ای منطبق با تاریخ شمسی امروز وجود داشته باشد، به طور خودکار فعال و برگردانده می‌شود.
+        ۳. اگر هیچ جلسه‌ای برای امروز نبود، آخرین جلسه فعال یا اولین جلسه برنامه‌ریزی‌شده برگردانده می‌شود.
+        """
+        from project_manager import project_manager
+        proj = project_manager.get_project(project_id)
+        if not proj:
+            return None
+
+        sessions = self.list_sessions(project_id, include_cancelled=False)
+        if not sessions:
+            return None
+
+        valid_ids = [s['id'] for s in sessions]
+        saved_active_sid = proj.get('active_session_id')
+        is_manual = proj.get('manual_session_override', False)
+
+        if is_manual and saved_active_sid in valid_ids:
+            return saved_active_sid
+
+        today_sess = self.get_auto_session_for_today(project_id, now=now)
+        if today_sess:
+            if saved_active_sid != today_sess['id']:
+                project_manager.set_project_active_session(project_id, today_sess['id'], is_manual=False)
+            return today_sess['id']
+
+        if saved_active_sid in valid_ids:
+            return saved_active_sid
+
+        first_sid = sessions[0]['id']
+        project_manager.set_project_active_session(project_id, first_sid, is_manual=False)
+        return first_sid
+
+    def seed_session_roster_explicit(self, project_id, session_id, actor_user_id=None):
+        sess = self.get_session(session_id)
+        if not sess or sess['project_id'] != project_id:
+            return False, "جلسه یافت نشد."
+        schedule_id = sess.get('schedule_id')
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            cursor = conn.cursor()
+            now_iso = get_iran_now().isoformat()
+            if schedule_id is not None:
+                cursor.execute("""
+                SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender,
+                       ps.phone, ps.card_title, ps.shift_time, ps.is_multi_section, ps.staff_code
+                FROM schedule_staff ss
+                JOIN project_staff ps ON ss.staff_id = ps.id
+                WHERE ss.schedule_id = %s AND ss.is_active = TRUE AND ps.is_active = TRUE
+                ORDER BY ps.id ASC
+                """, (schedule_id,))
+                eligible_staff = cursor.fetchall()
+            else:
+                cursor.execute("""
+                SELECT id, name, unit, section, position, gender,
+                       phone, card_title, shift_time, is_multi_section, staff_code
+                FROM project_staff
+                WHERE project_id = %s AND is_active = TRUE
+                ORDER BY id ASC
+                """, (project_id,))
+                eligible_staff = cursor.fetchall()
+
+            added = 0
+            for s in eligible_staff:
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, status, card_status,
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, '', '', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(project_id, session_id, staff_id) DO NOTHING;
+                """, (
+                    project_id, session_id, s['id'],
+                    s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                    s['phone'], s['card_title'], s['shift_time'], s['is_multi_section'], s['staff_code'],
+                    now_iso
+                ))
+                added += cursor.rowcount
+            conn.commit()
+            return True, f"{added} نیرو اضافه شد."
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def get_session(self, session_id):
+        if not session_id:
+            return None
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def get_session_by_name(self, project_id, name, schedule_id=None):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        if schedule_id is not None:
-            cursor.execute("""
-            SELECT * FROM sessions 
-            WHERE project_id = %s AND name = %s AND schedule_id = %s
-            """, (project_id, name.strip(), schedule_id))
-        else:
-            cursor.execute("""
-            SELECT * FROM sessions 
-            WHERE project_id = %s AND name = %s
-            """, (project_id, name.strip()))
-        row = cursor.fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            cursor = conn.cursor()
+            if schedule_id is not None:
+                cursor.execute("""
+                SELECT * FROM sessions 
+                WHERE project_id = %s AND name = %s AND schedule_id = %s
+                """, (project_id, name.strip(), schedule_id))
+            else:
+                cursor.execute("""
+                SELECT * FROM sessions 
+                WHERE project_id = %s AND name = %s
+                """, (project_id, name.strip()))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def get_session_by_date_and_schedule(self, project_id, schedule_id, session_date):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-        SELECT * FROM sessions 
-        WHERE project_id = %s AND schedule_id = %s AND session_date = %s
-        """, (project_id, schedule_id, session_date.strip()))
-        row = cursor.fetchone()
-        conn.close()
-        return dict(row) if row else None
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT * FROM sessions 
+            WHERE project_id = %s AND schedule_id = %s
+            """, (project_id, schedule_id))
+            for r in cursor.fetchall():
+                if is_same_calendar_day(r['session_date'], session_date):
+                    return dict(r)
+            return None
+        finally:
+            conn.close()
 
     def list_sessions(self, project_id, schedule_id=None, include_cancelled=False):
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        query = "SELECT * FROM sessions WHERE project_id = %s"
-        params = [project_id]
-        if schedule_id is not None:
-            query += " AND schedule_id = %s"
-            params.append(schedule_id)
-        if not include_cancelled:
-            query += " AND status != 'CANCELLED'"
-        query += " ORDER BY id ASC"
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            cursor = conn.cursor()
+            query = "SELECT * FROM sessions WHERE project_id = %s"
+            params = [project_id]
+            if schedule_id is not None:
+                query += " AND schedule_id = %s"
+                params.append(schedule_id)
+            if not include_cancelled:
+                query += " AND status != 'CANCELLED'"
+            query += " ORDER BY id ASC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def update_session_field(self, session_id, field_name, value):
-        allowed = ['name', 'session_date', 'time_str',
+        allowed = ['name', 'session_date', 'time_str', 'end_time_str',
                    'day_of_week', 'status', 'schedule_id']
         if field_name not in allowed:
             return False
+
+        if field_name == 'session_date' and value:
+            value = normalize_date_to_jalali(value)
+
         conn = self.db.get_connection()
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
-        sess = cursor.fetchone()
-        if not sess:
-            conn.close()
-            raise ValueError("جلسه مورد نظر یافت نشد.")
+            cursor.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+            sess = cursor.fetchone()
+            if not sess:
+                raise ValueError("جلسه مورد نظر یافت نشد.")
 
-        project_id = sess['project_id']
-        current_sched_id = sess['schedule_id']
-        current_date = sess['session_date']
+            project_id = sess['project_id']
+            current_sched_id = sess['schedule_id']
+            current_date = sess['session_date']
 
-        if field_name == 'schedule_id':
-            if value != current_sched_id:
-                cursor.execute(
-                    "SELECT COUNT(*) as cnt FROM attendance WHERE session_id = %s", (session_id,))
-                att_cnt = cursor.fetchone()['cnt']
-                if att_cnt > 0:
-                    conn.close()
-                    raise ValueError(
-                        "تغییر برنامه/کلاس برای جلسه‌ای که دارای سابقه حضور و غیاب است غیرمجاز می‌باشد.")
-
-            if value is not None:
-                cursor.execute(
-                    "SELECT id, project_id, is_active FROM schedules WHERE id = %s", (value,))
-                sched = cursor.fetchone()
-                if not sched or sched['project_id'] != project_id:
-                    conn.close()
-                    raise ValueError("برنامه انتخابی متعلق به این پروژه نیست.")
-                if not sched['is_active']:
-                    conn.close()
-                    raise ValueError(
-                        "برنامه انتخابی غیرفعال است و امکان اتصال جلسه به آن وجود ندارد.")
-
-                if current_date:
-                    cursor.execute("""
-                    SELECT id FROM sessions 
-                    WHERE project_id = %s AND schedule_id = %s AND session_date = %s AND id != %s AND status != 'CANCELLED'
-                    """, (project_id, value, current_date, session_id))
-                    if cursor.fetchone():
-                        conn.close()
+            if field_name == 'schedule_id':
+                if value != current_sched_id:
+                    cursor.execute(
+                        "SELECT COUNT(*) as cnt FROM attendance WHERE session_id = %s", (session_id,))
+                    att_cnt = cursor.fetchone()['cnt']
+                    if att_cnt > 0:
                         raise ValueError(
-                            f"در تاریخ {current_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+                            "تغییر برنامه/کلاس برای جلسه‌ای که دارای سابقه حضور و غیاب است غیرمجاز می‌باشد.")
 
-        if field_name == 'session_date':
-            new_date = str(value or '').strip()
-            if current_sched_id is not None and new_date:
-                cursor.execute("""
-                SELECT id FROM sessions 
-                WHERE project_id = %s AND schedule_id = %s AND session_date = %s AND id != %s AND status != 'CANCELLED'
-                """, (project_id, current_sched_id, new_date, session_id))
-                if cursor.fetchone():
-                    conn.close()
-                    raise ValueError(
-                        f"در تاریخ {new_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+                if value is not None:
+                    cursor.execute(
+                        "SELECT id, project_id, is_active FROM schedules WHERE id = %s", (value,))
+                    sched = cursor.fetchone()
+                    if not sched or sched['project_id'] != project_id:
+                        raise ValueError("برنامه انتخابی متعلق به این پروژه نیست.")
+                    if not sched['is_active']:
+                        raise ValueError(
+                            "برنامه انتخابی غیرفعال است و امکان اتصال جلسه به آن وجود ندارد.")
 
-        cursor.execute(
-            f"UPDATE sessions SET {field_name} = %s WHERE id = %s", (value, session_id))
-        conn.commit()
-        conn.close()
-        return True
+                    if current_date:
+                        cursor.execute("""
+                        SELECT id, session_date FROM sessions 
+                        WHERE project_id = %s AND schedule_id = %s AND id != %s AND status != 'CANCELLED'
+                        """, (project_id, value, session_id))
+                        for r in cursor.fetchall():
+                            if is_same_calendar_day(r['session_date'], current_date):
+                                raise ValueError(
+                                    f"در تاریخ {current_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+
+            if field_name == 'session_date':
+                new_date = str(value or '').strip()
+                if current_sched_id is not None and new_date:
+                    cursor.execute("""
+                    SELECT id, session_date FROM sessions 
+                    WHERE project_id = %s AND schedule_id = %s AND id != %s AND status != 'CANCELLED'
+                    """, (project_id, current_sched_id, session_id))
+                    for r in cursor.fetchall():
+                        if is_same_calendar_day(r['session_date'], new_date):
+                            raise ValueError(
+                                f"در تاریخ {new_date} برای این برنامه جلسه دیگری از قبل وجود دارد.")
+
+            cursor.execute(
+                f"UPDATE sessions SET {field_name} = %s WHERE id = %s", (value, session_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def toggle_session_status(self, session_id):
         sess = self.get_session(session_id)
@@ -284,36 +426,39 @@ class AttendanceManager:
         return self.update_session_field(session_id, 'status', 'CANCELLED')
 
     def get_session_attendance(self, project_id, session_id):
+        if not session_id:
+            return []
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-        SELECT 
-            a.staff_id, 
-            a.project_id, 
-            a.session_id,
-            a.staff_name_snapshot,
-            a.unit_snapshot,
-            a.section_snapshot,
-            a.position_snapshot,
-            a.gender_snapshot,
-            a.phone_snapshot,
-            a.card_title_snapshot,
-            a.shift_time_snapshot,
-            a.is_multi_section_snapshot,
-            a.staff_code_snapshot,
-            COALESCE(a.id, 0) as attendance_id,
-            COALESCE(a.status, '') as status,
-            COALESCE(a.card_status, '') as card_status,
-            COALESCE(a.late_tracking, '') as late_tracking,
-            COALESCE(a.description, '') as description,
-            a.updated_at
-        FROM attendance a
-        WHERE a.project_id = %s AND a.session_id = %s
-        ORDER BY a.staff_id ASC
-        """, (project_id, session_id))
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT 
+                a.staff_id, 
+                a.project_id, 
+                a.session_id,
+                a.staff_name_snapshot,
+                a.unit_snapshot,
+                a.section_snapshot,
+                a.position_snapshot,
+                a.gender_snapshot,
+                a.phone_snapshot,
+                a.card_title_snapshot,
+                a.shift_time_snapshot,
+                a.is_multi_section_snapshot,
+                a.staff_code_snapshot,
+                COALESCE(a.id, 0) as attendance_id,
+                COALESCE(a.status, '') as status,
+                COALESCE(a.card_status, '') as card_status,
+                COALESCE(a.late_tracking, '') as late_tracking,
+                COALESCE(a.description, '') as description,
+                a.updated_at
+            FROM attendance a
+            WHERE a.project_id = %s AND a.session_id = %s
+            ORDER BY a.staff_id ASC
+            """, (project_id, session_id))
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
 
         result = []
         for r in rows:
@@ -338,34 +483,39 @@ class AttendanceManager:
         return result
 
     def get_staff_session_attendance(self, project_id, session_id, staff_id):
+        if not session_id:
+            return None
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-        SELECT 
-            a.staff_id, 
-            a.project_id, 
-            a.session_id,
-            a.staff_name_snapshot,
-            a.unit_snapshot,
-            a.section_snapshot,
-            a.position_snapshot,
-            a.gender_snapshot,
-            a.phone_snapshot,
-            a.card_title_snapshot,
-            a.shift_time_snapshot,
-            a.is_multi_section_snapshot,
-            a.staff_code_snapshot,
-            COALESCE(a.id, 0) as attendance_id,
-            COALESCE(a.status, '') as status,
-            COALESCE(a.card_status, '') as card_status,
-            COALESCE(a.late_tracking, '') as late_tracking,
-            COALESCE(a.description, '') as description,
-            a.updated_at
-        FROM attendance a
-        WHERE a.project_id = %s AND a.session_id = %s AND a.staff_id = %s
-        """, (project_id, session_id, staff_id))
-        row = cursor.fetchone()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT 
+                a.staff_id, 
+                a.project_id, 
+                a.session_id,
+                a.staff_name_snapshot,
+                a.unit_snapshot,
+                a.section_snapshot,
+                a.position_snapshot,
+                a.gender_snapshot,
+                a.phone_snapshot,
+                a.card_title_snapshot,
+                a.shift_time_snapshot,
+                a.is_multi_section_snapshot,
+                a.staff_code_snapshot,
+                COALESCE(a.id, 0) as attendance_id,
+                COALESCE(a.status, '') as status,
+                COALESCE(a.card_status, '') as card_status,
+                COALESCE(a.late_tracking, '') as late_tracking,
+                COALESCE(a.description, '') as description,
+                a.updated_at
+            FROM attendance a
+            WHERE a.project_id = %s AND a.session_id = %s AND a.staff_id = %s
+            """, (project_id, session_id, staff_id))
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+
         if not row:
             return None
         d = dict(row)
@@ -405,34 +555,33 @@ class AttendanceManager:
         phone = str(staff.get("phone", "")).strip()
 
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT phone_snapshot FROM attendance WHERE project_id = %s AND session_id = %s AND staff_id = %s",
-            (project_id, session_id, staff_id)
-        )
-        snap_row = cursor.fetchone()
-        if snap_row and snap_row['phone_snapshot']:
-            phone = str(snap_row['phone_snapshot']).strip()
-
-        if sync_same_phone and phone and phone not in ("None", "-", ""):
-            cursor.execute("""
-            SELECT a.staff_id
-            FROM attendance a
-            WHERE a.project_id = %s
-              AND a.session_id = %s
-              AND a.phone_snapshot = %s
-              AND a.phone_snapshot != ''
-              AND a.phone_snapshot IS NOT NULL
-            """, (project_id, session_id, phone))
-            matched = [r['staff_id'] for r in cursor.fetchall()]
-            if matched:
-                target_staff_ids = matched
-            if staff_id not in target_staff_ids:
-                target_staff_ids.append(staff_id)
-
-        now_iso = datetime.now().isoformat()
         try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT phone_snapshot FROM attendance WHERE project_id = %s AND session_id = %s AND staff_id = %s",
+                (project_id, session_id, staff_id)
+            )
+            snap_row = cursor.fetchone()
+            if snap_row and snap_row['phone_snapshot']:
+                phone = str(snap_row['phone_snapshot']).strip()
+
+            if sync_same_phone and phone and phone not in ("None", "-", ""):
+                cursor.execute("""
+                SELECT a.staff_id
+                FROM attendance a
+                WHERE a.project_id = %s
+                  AND a.session_id = %s
+                  AND a.phone_snapshot = %s
+                  AND a.phone_snapshot != ''
+                  AND a.phone_snapshot IS NOT NULL
+                """, (project_id, session_id, phone))
+                matched = [r['staff_id'] for r in cursor.fetchall()]
+                if matched:
+                    target_staff_ids = matched
+                if staff_id not in target_staff_ids:
+                    target_staff_ids.append(staff_id)
+
+            now_iso = get_iran_now().isoformat()
             for s_id in target_staff_ids:
                 cursor.execute("""
                 UPDATE attendance 
@@ -464,34 +613,33 @@ class AttendanceManager:
         phone = str(staff.get("phone", "")).strip()
 
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT phone_snapshot FROM attendance WHERE project_id = %s AND session_id = %s AND staff_id = %s",
-            (project_id, session_id, staff_id)
-        )
-        snap_row = cursor.fetchone()
-        if snap_row and snap_row['phone_snapshot']:
-            phone = str(snap_row['phone_snapshot']).strip()
-
-        if sync_same_phone and phone and phone not in ("None", "-", ""):
-            cursor.execute("""
-            SELECT a.staff_id
-            FROM attendance a
-            WHERE a.project_id = %s
-              AND a.session_id = %s
-              AND a.phone_snapshot = %s
-              AND a.phone_snapshot != ''
-              AND a.phone_snapshot IS NOT NULL
-            """, (project_id, session_id, phone))
-            matched = [r['staff_id'] for r in cursor.fetchall()]
-            if matched:
-                target_staff_ids = matched
-            if staff_id not in target_staff_ids:
-                target_staff_ids.append(staff_id)
-
-        now_iso = datetime.now().isoformat()
         try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT phone_snapshot FROM attendance WHERE project_id = %s AND session_id = %s AND staff_id = %s",
+                (project_id, session_id, staff_id)
+            )
+            snap_row = cursor.fetchone()
+            if snap_row and snap_row['phone_snapshot']:
+                phone = str(snap_row['phone_snapshot']).strip()
+
+            if sync_same_phone and phone and phone not in ("None", "-", ""):
+                cursor.execute("""
+                SELECT a.staff_id
+                FROM attendance a
+                WHERE a.project_id = %s
+                  AND a.session_id = %s
+                  AND a.phone_snapshot = %s
+                  AND a.phone_snapshot != ''
+                  AND a.phone_snapshot IS NOT NULL
+                """, (project_id, session_id, phone))
+                matched = [r['staff_id'] for r in cursor.fetchall()]
+                if matched:
+                    target_staff_ids = matched
+                if staff_id not in target_staff_ids:
+                    target_staff_ids.append(staff_id)
+
+            now_iso = get_iran_now().isoformat()
             for s_id in target_staff_ids:
                 cursor.execute("""
                 UPDATE attendance 
@@ -504,6 +652,26 @@ class AttendanceManager:
             conn.rollback()
             logging.error(f"update_card_status error: {e}")
             return False
+        finally:
+            conn.close()
+
+    def mark_empty_as_absent(self, project_id, session_id):
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            now_iso = get_iran_now().isoformat()
+            cursor.execute("""
+            UPDATE attendance
+            SET status = 'غایب', updated_at = %s
+            WHERE project_id = %s AND session_id = %s AND (status IS NULL OR status = '');
+            """, (now_iso, project_id, session_id))
+            updated_cnt = cursor.rowcount
+            conn.commit()
+            return updated_cnt
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"mark_empty_as_absent error: {e}")
+            return 0
         finally:
             conn.close()
 
@@ -520,15 +688,15 @@ class AttendanceManager:
         if not record:
             return False
         current_note = record.get("late_tracking", "")
-        now_time = datetime.now().strftime("%H:%M")
+        now_time = get_iran_now().strftime("%H:%M")
         new_entry = f"[📞 {now_time} - {note.strip()}]"
         final_note = f"{current_note} | {new_entry}" if current_note and current_note not in (
             "None", "-", "") else new_entry
 
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        now_iso = datetime.now().isoformat()
         try:
+            cursor = conn.cursor()
+            now_iso = get_iran_now().isoformat()
             cursor.execute("""
             UPDATE attendance 
             SET late_tracking = %s, updated_at = %s
@@ -555,15 +723,15 @@ class AttendanceManager:
         if not record:
             return False
         current_desc = record.get("description", "")
-        now_time = datetime.now().strftime("%H:%M")
+        now_time = get_iran_now().strftime("%H:%M")
         new_entry = f"({now_time}) {note.strip()}"
         final_desc = f"{current_desc} | {new_entry}" if current_desc and current_desc not in (
             "None", "-", "") else new_entry
 
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        now_iso = datetime.now().isoformat()
         try:
+            cursor = conn.cursor()
+            now_iso = get_iran_now().isoformat()
             cursor.execute("""
             UPDATE attendance 
             SET description = %s, updated_at = %s
@@ -578,8 +746,10 @@ class AttendanceManager:
             conn.close()
 
     def get_latecomers(self, project_id, session_id):
+        if not session_id:
+            return []
         all_att = self.get_session_attendance(project_id, session_id)
-        now = datetime.now()
+        now = get_iran_now()
         latecomers = []
         for u in all_att:
             status = str(u.get("status", "")).strip()
@@ -595,24 +765,24 @@ class AttendanceManager:
         return latecomers
 
     def add_staff_to_session_roster(self, project_id, session_id, staff_ids):
-        if not staff_ids:
+        if not staff_ids or not session_id:
             return True, 0
         if isinstance(staff_ids, int):
             staff_ids = [staff_ids]
 
         conn = self.db.get_connection()
-        cursor = conn.cursor()
-        now_iso = datetime.now().isoformat()
-        cursor.execute("""
-        SELECT id, name, unit, section, position, gender,
-               phone, card_title, shift_time, is_multi_section, staff_code
-        FROM project_staff
-        WHERE project_id = %s AND id = ANY(%s)
-        """, (project_id, list(staff_ids)))
-        staff_rows = cursor.fetchall()
-
-        added_cnt = 0
         try:
+            cursor = conn.cursor()
+            now_iso = get_iran_now().isoformat()
+            cursor.execute("""
+            SELECT id, name, unit, section, position, gender,
+                   phone, card_title, shift_time, is_multi_section, staff_code
+            FROM project_staff
+            WHERE project_id = %s AND id = ANY(%s)
+            """, (project_id, list(staff_ids)))
+            staff_rows = cursor.fetchall()
+
+            added_cnt = 0
             for s in staff_rows:
                 cursor.execute("""
                 INSERT INTO attendance (
@@ -631,12 +801,12 @@ class AttendanceManager:
                 ))
                 added_cnt += cursor.rowcount
             conn.commit()
+            return True, added_cnt
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
-        return True, added_cnt
 
 
 attendance_manager = AttendanceManager()

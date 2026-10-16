@@ -1,218 +1,302 @@
 import os
 import sys
-import threading
 import time
+import threading
 import logging
-from datetime import datetime
 from config import (
     DB_BACKUP_INTERVAL, LATE_REMINDER_INTERVAL, SHORTAGE_CHECK_INTERVAL,
-    DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE, LOGS_DIR
+    DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
 )
 from db_manager import db_instance
 from project_manager import project_manager
 from attendance_manager import attendance_manager
 from shortage_manager import shortage_manager
 from permission_manager import permission_manager
+from report_manager import report_manager
 from excel_manager import excel_manager
-from utils import get_persian_weekday
+from utils import (
+    get_iran_now, get_today_jalali_str, normalize_date_to_jalali,
+    is_same_calendar_day, is_time_in_window, is_date_in_jalali_range,
+    get_persian_weekday
+)
 
-logger = logging.getLogger("worker_manager")
 
 class WorkerManager:
-    def __init__(self, bot_instance=None):
-        self.bot = bot_instance
-        self.last_daily_report_date = None
-        self.is_running = False
+    def __init__(self, db=db_instance):
+        self.db = db
+        self.bot = None
+        self._running = False
+        self._threads = []
+        self._last_daily_report_date = None
+        self._last_synced_jalali_date = None
 
     def set_bot(self, bot_instance):
         self.bot = bot_instance
 
-    def start_workers(self):
-        if self.is_running:
-            return
-        self.is_running = True
-        threading.Thread(target=self._daily_report_loop, daemon=True).start()
-        threading.Thread(target=self._late_reminder_loop, daemon=True).start()
-        threading.Thread(target=self._check_shortages_loop, daemon=True).start()
-        threading.Thread(target=self._auto_backup_loop, daemon=True).start()
-        logger.info("Background workers started successfully.")
+    def _safe_notify(self, user_id, text, reply_markup=None):
+        """ارسال ایمن نوتیفیکیشن با وقفه کوتاه جهت جلوگیری از Flood/Rate-Limit سرور بله"""
+        if not self.bot or not user_id:
+            return False
+        try:
+            self.bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode="Markdown")
+            time.sleep(0.08)
+            return True
+        except Exception as e:
+            logging.debug(f"Notification delivery notice for user {user_id}: {e}")
+            return False
 
-    def get_today_sessions(self, project_id):
+    def get_today_sessions(self, project_id, now=None):
         """
-        Determines the relevant session(s) for today strictly based on date or schedule.
-        Validates:
-        1. Project is ACTIVE.
-        2. Session is not CANCELLED.
-        3. Schedule (if present) is strictly ACTIVE (is_active == 1).
-        If no active session is occurring today, returns an empty list [].
+        دریافت جلسات فعال امروز پروژه (پشتیبانی همزمان از تاریخ شمسی 1405/MM/DD و میلادی YYYY-MM-DD)
+        به همراه رعایت وضعیت فعال بودن پروژه و برنامه کلاسی (Schedule).
         """
         proj = project_manager.get_project(project_id)
         if not proj or proj.get('status') != 'ACTIVE':
             return []
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        today_day = get_persian_weekday(datetime.now())
+        if now is None:
+            now = get_iran_now()
+        today_jalali = get_today_jalali_str(now)
+        today_weekday = get_persian_weekday(now)
 
-        all_sessions = attendance_manager.list_sessions(project_id, include_cancelled=False)
-        if not all_sessions:
+        # بررسی قرار داشتن تاریخ امروز در بازه کلی تاریخ پروژه
+        if not is_date_in_jalali_range(today_jalali, proj.get('start_date'), proj.get('end_date')):
             return []
 
-        # Query all active schedules for this project
-        conn = db_instance.get_sqlite_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM schedules WHERE project_id = ? AND is_active = 1", (project_id,))
-        active_sched_ids = {r['id'] for r in cursor.fetchall()}
-        conn.close()
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT s.*
+            FROM sessions s
+            LEFT JOIN schedules sc ON s.schedule_id = sc.id
+            WHERE s.project_id = %s
+              AND s.status != 'CANCELLED'
+              AND (s.schedule_id IS NULL OR sc.is_active = TRUE)
+            ORDER BY s.id ASC
+            """, (project_id,))
+            all_sessions = [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Error in get_today_sessions for project {project_id}: {e}")
+            return []
+        finally:
+            conn.close()
 
-        valid_candidates = []
+        matched_sessions = []
         for s in all_sessions:
-            if s.get('status') == 'CANCELLED':
+            s_date = str(s.get('session_date') or '').strip()
+            if s_date and is_same_calendar_day(s_date, today_jalali):
+                matched_sessions.append(s)
+
+        # اگر جلسات پروژه بدون تاریخ ثبت شده باشند، ولی جلسه فعال روی امروز تنظیم شده باشد
+        if not matched_sessions:
+            active_sid = proj.get('active_session_id')
+            for s in all_sessions:
+                if s['id'] == active_sid and not str(s.get('session_date') or '').strip():
+                    rec_days = str(proj.get('recurring_days') or '').strip()
+                    if not rec_days or rec_days in ('هفتگی', 'هرروز') or today_weekday in rec_days:
+                        matched_sessions.append(s)
+
+        return matched_sessions
+
+    def is_session_in_active_hours(self, proj, sess, now=None):
+        """بررسی اینکه آیا جلسه در ساعت فعالیت مجاز خود در روز جاری قرار دارد یا خیر"""
+        if now is None:
+            now = get_iran_now()
+        start_t = str(sess.get('time_str') or proj.get('activation_time') or '07:00').strip()
+        end_t = str(sess.get('end_time_str') or proj.get('end_time') or '23:00').strip()
+        return is_time_in_window(start_t, end_t, now=now)
+
+    def sync_all_projects_calendar(self, now=None):
+        """
+        همگام‌سازی خودکار تقویم شمسی پروژه‌ها:
+        ۱. در آغاز هر روز شمسی، قفل دستی جلسات روز قبل را باز می‌کند تا جلسه روز جدید خودکار فعال شود.
+        ۲. اگر جلسه‌ای دقیقاً منطبق با تاریخ شمسی امروز وجود داشته باشد، آن را به عنوان جلسه فعال پروژه تنظیم می‌کند.
+        """
+        if now is None:
+            now = get_iran_now()
+        today_jalali = get_today_jalali_str(now)
+        is_new_day = (self._last_synced_jalali_date != today_jalali)
+
+        active_projects = project_manager.list_projects(status='ACTIVE')
+        for proj in active_projects:
+            pid = proj['id']
+            if not proj.get('auto_schedule_enabled', True):
                 continue
-            sched_id = s.get('schedule_id')
-            if sched_id is not None and sched_id not in active_sched_ids:
-                # Schedule is inactive/paused: skip session!
-                continue
-            valid_candidates.append(s)
 
-        # 1. Exact calendar date match (today)
-        date_matches = [
-            s for s in valid_candidates 
-            if str(s.get('session_date', '')).strip() == today_str
+            today_sess = attendance_manager.get_auto_session_for_today(pid, now=now)
+            if today_sess:
+                if is_new_day or not proj.get('manual_session_override', False):
+                    if proj.get('active_session_id') != today_sess['id']:
+                        project_manager.set_project_active_session(pid, today_sess['id'], is_manual=False)
+                        logging.info(f"Auto-activated session '{today_sess['name']}' (ID {today_sess['id']}) for project {pid} on {today_jalali}")
+
+        if is_new_day:
+            self._last_synced_jalali_date = today_jalali
+
+    def start_workers(self):
+        if self._running:
+            return
+        self._running = True
+
+        worker_targets = [
+            ("CalendarSyncWorker", self._calendar_sync_loop),
+            ("ShortageWorker", self._shortage_loop),
+            ("LateReminderWorker", self._late_reminder_loop),
+            ("BackupWorker", self._backup_loop),
+            ("DailyReportWorker", self._daily_report_loop),
         ]
-        if date_matches:
-            return date_matches
 
-        # 2. Weekday match for recurring schedules on active sessions occurring today
-        day_matches = [
-            s for s in valid_candidates 
-            if today_day and today_day in str(s.get('day_of_week', '')).strip() 
-            and (not s.get('session_date') or str(s.get('session_date', '')).strip() == today_str)
-        ]
-        if day_matches:
-            return day_matches
+        for name, target in worker_targets:
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
 
-        # No session scheduled for today: return empty list. Never guess!
-        return []
+    def stop_workers(self):
+        self._running = False
 
-    def _daily_report_loop(self):
-        while True:
+    def _calendar_sync_loop(self):
+        while self._running:
             try:
-                now = datetime.now()
-                if (now.hour == DAILY_REPORT_HOUR and 
-                    now.minute == DAILY_REPORT_MINUTE and 
-                    self.last_daily_report_date != now.date()):
-                    
-                    active_projects = project_manager.list_projects(status='ACTIVE')
-                    for proj in active_projects:
-                        pid = proj['id']
-                        today_sessions = self.get_today_sessions(pid)
-                        for active_session in today_sessions:
-                            sid = active_session['id']
-
-                            attendance_manager.mark_empty_as_absent(pid, sid)
-                            excel_path = excel_manager.export_project_excel(pid)
-
-                            if self.bot and excel_path and os.path.exists(excel_path):
-                                members = permission_manager.get_project_members(pid)
-                                recipients = [m['user_id'] for m in members if m['role'] in ('admin', 'super_admin') and m['is_active']]
-                                caption = f"📊 **گزارش پایانی و فایل نهایی - {proj['name']} ({active_session['name']})**\nافراد تعیین تکلیف نشده خودکار غایب خوردند."
-                                for uid in set(recipients):
-                                    try:
-                                        with open(excel_path, "rb") as f:
-                                            self.bot.send_document(uid, f, caption=caption, parse_mode="Markdown")
-                                    except Exception as err:
-                                        logger.error(f"Failed to send daily report to {uid}: {err}")
-
-                    self.last_daily_report_date = now.date()
+                self.sync_all_projects_calendar()
             except Exception as e:
-                logger.error(f"Error in daily_report_loop: {e}")
+                logging.error(f"CalendarSyncWorker error: {e}")
             time.sleep(60)
 
-    def _late_reminder_loop(self):
-        while True:
-            time.sleep(LATE_REMINDER_INTERVAL)
+    def _shortage_loop(self):
+        while self._running:
             try:
-                active_projects = project_manager.list_projects(status='ACTIVE')
-                for proj in active_projects:
-                    pid = proj['id']
-                    today_sessions = self.get_today_sessions(pid)
-                    for active_session in today_sessions:
-                        sid = active_session['id']
+                if self.bot:
+                    now = get_iran_now()
+                    today_jalali = get_today_jalali_str(now)
+                    unnotified = shortage_manager.get_unnotified_shortages()
 
-                        latecomers = attendance_manager.get_latecomers(pid, sid)
-                        untracked_late = [l for l in latecomers if not str(l.get('late_tracking', '')).strip()]
+                    for sh in unnotified:
+                        pid = sh['project_id']
+                        proj = project_manager.get_project(pid)
+                        if not proj or proj.get('status') != 'ACTIVE':
+                            shortage_manager.mark_shortage_notified(sh['id'])
+                            continue
 
-                        if untracked_late and self.bot:
-                            msg = f"⚠️ **یادآوری لیست متأخرین - {proj['name']}:**\nهم‌اکنون **{len(untracked_late)} نفر** در جلسه «{active_session['name']}» بدون پیگیری تأخیر هستند. لطفاً جهت پیگیری تماس بگیرید."
-                            members = permission_manager.get_project_members(pid)
-                            for m in members:
-                                if m['is_active'] and m.get('role') != 'unit_head':
-                                    if permission_manager.is_operator_absent_today(pid, m['user_id']):
-                                        continue
-                                    try:
-                                        self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
-                                    except Exception:
-                                        pass
-            except Exception as e:
-                logger.error(f"Error in late_reminder_loop: {e}")
+                        # اگر تاریخ پایان پروژه گذشته است، کمبود قدیمی ارسال نشود
+                        p_end = normalize_date_to_jalali(proj.get('end_date') or '')
+                        if p_end and len(p_end) == 10 and today_jalali > p_end:
+                            shortage_manager.mark_shortage_notified(sh['id'])
+                            continue
 
-    def _check_shortages_loop(self):
-        while True:
-            time.sleep(SHORTAGE_CHECK_INTERVAL)
-            try:
-                unnotified = shortage_manager.get_unnotified_shortages()
-                if not unnotified:
-                    continue
-                grouped = {}
-                for s in unnotified:
-                    key = (s['project_id'], s['unit'], s['section'], s.get('target_group', 'عمومی'), s.get('description', ''))
-                    if key not in grouped:
-                        grouped[key] = []
-                    grouped[key].append(s)
-
-                for (pid, unit, section, target_grp, desc), items in grouped.items():
-                    pname = items[0].get('project_name', f'پروژه {pid}')
-                    total_count = sum(int(item.get('count', 1)) for item in items)
-                    msg = (
-                        f"🔔 **اعلام کمبود نیرو - {pname}**\n\n"
-                        f"🏢 واحد: **{unit}**\n"
-                        f"🗂 بخش: **{section}**\n"
-                        f"👥 تعداد: **{total_count} نفر** ({target_grp})\n"
-                        f"📝 توضیحات: {desc}\n\n"
-                        f"لطفاً جهت تأمین کمبود اقدام فرمایید."
-                    )
-                    success_count = 0
-                    if self.bot:
+                        pname = sh.get('project_name') or proj.get('name', '')
+                        grp = sh.get('target_group') or 'عمومی'
+                        cnt = sh.get('count', 1)
+                        msg = (
+                            f"🔔 **اعلام کمبود نیرو - {pname}**\n\n"
+                            f"🏢 واحد: **{sh['unit']}**\n"
+                            f"🗂 بخش: **{sh['section']}**\n"
+                            f"👥 تعداد: **{cnt} نفر** ({grp})\n"
+                            f"📝 توضیحات: {sh.get('description') or 'ندارد'}\n\n"
+                            f"لطفاً جهت معرفی نیروی جایگزین از منوی ربات اقدام فرمایید."
+                        )
                         members = permission_manager.get_project_members(pid)
                         for m in members:
-                            gender_match = (target_grp == 'عمومی') or (m.get('project_gender') == target_grp)
-                            if m['is_active'] and m.get('role') != 'unit_head' and (m['role'] in ('admin', 'super_admin') or gender_match):
-                                if permission_manager.is_operator_absent_today(pid, m['user_id']):
-                                    continue
-                                try:
-                                    self.bot.send_message(m['user_id'], msg, parse_mode="Markdown")
-                                    success_count += 1
-                                except Exception as send_err:
-                                    logger.error(f"Failed to send shortage notification to {m['user_id']}: {send_err}")
+                            gender_match = (grp == 'عمومی') or (m.get('project_gender') == grp)
+                            if m.get('is_active') and m.get('role') != 'unit_head' and (
+                                m.get('role') in ('admin', 'super_admin') or gender_match
+                            ):
+                                self._safe_notify(m['user_id'], msg)
 
-                    # Mark as notified strictly if at least one delivery was successful (or offline mock)
-                    if success_count > 0 or not self.bot:
-                        for item in items:
-                            shortage_manager.mark_shortage_notified(item['id'])
-                    else:
-                        logger.warning(f"Shortage batch for project {pid} failed delivery to all recipients. Retaining unnotified status.")
+                        shortage_manager.mark_shortage_notified(sh['id'])
             except Exception as e:
-                logger.error(f"Error in check_shortages_loop: {e}")
+                logging.error(f"ShortageWorker error: {e}")
+            time.sleep(max(5, SHORTAGE_CHECK_INTERVAL))
 
-    def _auto_backup_loop(self):
-        while True:
-            time.sleep(DB_BACKUP_INTERVAL)
+    def _late_reminder_loop(self):
+        while self._running:
+            time.sleep(max(60, LATE_REMINDER_INTERVAL))
             try:
-                db_instance.backup_database(label="hourly")
+                if not self.bot:
+                    continue
+                now = get_iran_now()
+                active_projects = project_manager.list_projects(status='ACTIVE')
+
+                for proj in active_projects:
+                    pid = proj['id']
+                    today_sessions = self.get_today_sessions(pid, now=now)
+                    if not today_sessions:
+                        continue
+
+                    for sess in today_sessions:
+                        # فقط اگر در بازه ساعت فعالیت جلسه/پروژه هستیم نوتیفیکیشن متأخرین ارسال شود
+                        if not self.is_session_in_active_hours(proj, sess, now=now):
+                            continue
+
+                        sid = sess['id']
+                        latecomers = attendance_manager.get_latecomers(pid, sid)
+                        untracked = [u for u in latecomers if not str(u.get('late_tracking', '')).strip()]
+                        if not untracked:
+                            continue
+
+                        members = permission_manager.get_project_members(pid)
+                        for m in members:
+                            if not m.get('is_active') or m.get('role') == 'unit_head':
+                                continue
+                            uid = m['user_id']
+                            user_late_list = permission_manager.apply_gender_filter(untracked, uid, pid)
+                            if user_late_list:
+                                start_t = sess.get('time_str') or proj.get('activation_time') or '07:00'
+                                end_t = sess.get('end_time_str') or proj.get('end_time') or '23:00'
+                                msg = (
+                                    f"🚨 **یادآوری پیگیری متأخرین - {proj['name']}**\n"
+                                    f"📅 جلسه: **{sess['name']}** (ساعت فعالیت: `{start_t}` تا `{end_t}`)\n\n"
+                                    f"تعداد **{len(user_late_list)} نفر** از نیروهای شیفت هنوز وضعیت حضورشان ثبت نشده و پیگیری هم برایشان درج نگردیده است.\n"
+                                    f"لطفاً از بخش «لیست متأخرین» پیگیری فرمایید."
+                                )
+                                self._safe_notify(uid, msg)
+            except Exception as e:
+                logging.error(f"LateReminderWorker error: {e}")
+
+    def _backup_loop(self):
+        while self._running:
+            time.sleep(max(300, DB_BACKUP_INTERVAL))
+            try:
+                db_instance.backup_database(label="periodic")
                 active_projects = project_manager.list_projects(status='ACTIVE')
                 for proj in active_projects:
-                    excel_manager.backup_project_excel(proj['id'], label="hourly")
+                    try:
+                        excel_manager.backup_project_excel(proj['id'], label="periodic")
+                    except Exception as ex_err:
+                        logging.warning(f"Periodic excel backup warning for project {proj['id']}: {ex_err}")
             except Exception as e:
-                logger.error(f"Error in auto_backup_loop: {e}")
+                logging.error(f"BackupWorker error: {e}")
+
+    def _daily_report_loop(self):
+        while self._running:
+            try:
+                now = get_iran_now()
+                today_jalali = get_today_jalali_str(now)
+                if (now.hour == DAILY_REPORT_HOUR and now.minute >= DAILY_REPORT_MINUTE and
+                        self._last_daily_report_date != today_jalali):
+                    self._last_daily_report_date = today_jalali
+                    if self.bot:
+                        active_projects = project_manager.list_projects(status='ACTIVE')
+                        for proj in active_projects:
+                            pid = proj['id']
+                            today_sessions = self.get_today_sessions(pid, now=now)
+                            for sess in today_sessions:
+                                sid = sess['id']
+                                attendance_manager.mark_empty_as_absent(pid, sid)
+                                stats = report_manager.get_dashboard_stats(pid, sid)
+                                summary = (
+                                    f"🌙 **گزارش جمع‌بندی شبانه - {proj['name']}**\n"
+                                    f"📅 جلسه: **{sess['name']}** (مورخ `{today_jalali}`)\n\n"
+                                    f"👥 کل مورد انتظار: {stats['total_expected']}\n"
+                                    f"✅ کل حاضرین: {stats['total_present']}\n"
+                                    f"📊 درصد مشارکت: **{stats['overall_percentage']}%**"
+                                )
+                                admins = permission_manager.get_project_admins(pid, include_global=True)
+                                for adm in admins:
+                                    self._safe_notify(adm['user_id'], summary)
+            except Exception as e:
+                logging.error(f"DailyReportWorker error: {e}")
+            time.sleep(30)
+
 
 worker_manager = WorkerManager()

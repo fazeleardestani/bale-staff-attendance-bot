@@ -3,7 +3,11 @@ import sys
 from datetime import datetime
 from db_manager import db_instance
 from attendance_manager import attendance_manager
-from utils import safe_markdown, normalize_persian
+from utils import (
+    safe_markdown, normalize_persian, to_persian_digits,
+    get_today_jalali_str, normalize_date_to_jalali, get_persian_weekday,
+    parse_any_date_to_datetime
+)
 
 
 class ClassReportDataBuilder:
@@ -14,6 +18,7 @@ class ClassReportDataBuilder:
 
         proj = project_manager.get_project(project_id)
         sess = attendance_manager.get_session(session_id)
+        # فراخوانی get_session_attendance اکنون به طور خودکار در صورت خالی بودن جلسه، کادر را در آن جلسه بارگذاری می‌کند
         all_att_raw = attendance_manager.get_session_attendance(project_id, session_id)
         org_chart = project_manager.get_project_org_chart(project_id)
 
@@ -21,8 +26,21 @@ class ClassReportDataBuilder:
         all_att = [s for s in all_att_raw if "بدون شیفت" not in str(s.get('status', '')).strip()]
 
         proj_name = proj['name'] if proj else "کلاس"
-        sess_date = sess.get('session_date') or datetime.now().strftime("%Y/%m/%d") if sess else ""
-        sess_day = sess.get('day_of_week') or "" if sess else ""
+
+        # محاسبه دقیق تاریخ شمسی جلسه (یا تاریخ شمسی امروز به عنوان پیش‌فرض)
+        raw_sess_date = sess.get('session_date') if sess else ""
+        if raw_sess_date and str(raw_sess_date).strip():
+            sess_date = normalize_date_to_jalali(raw_sess_date)
+        else:
+            sess_date = get_today_jalali_str()
+
+        # محاسبه دقیق روز هفته جلسه
+        sess_day = (sess.get('day_of_week') or "").strip() if sess else ""
+        if not sess_day and proj and proj.get('recurring_days'):
+            sess_day = str(proj.get('recurring_days')).strip()
+        if not sess_day:
+            dt_obj = parse_any_date_to_datetime(sess_date)
+            sess_day = get_persian_weekday(dt_obj)
 
         # 1. Identify Senior / Arshad staff
         arshad_staff = None
@@ -41,7 +59,7 @@ class ClassReportDataBuilder:
                 continue
 
             u_raw = str(s.get('unit') or '').strip()
-            if not u_raw or u_raw == 'None':
+            if not u_raw or u_raw in ('None', '-'):
                 u_raw = 'عمومی'
 
             sec_raw = str(s.get('section') or '').strip()
@@ -87,6 +105,7 @@ class ClassReportDataBuilder:
 
         return {
             'project_name': proj_name,
+            'session_name': sess.get('name', '') if sess else '',
             'session_date': sess_date,
             'session_day': sess_day,
             'arshad': arshad_staff,
@@ -100,69 +119,10 @@ class PersianClassReportRenderer:
     """Renders validated class report data into the required Persian business format with emojis and Shamsi date."""
 
     @staticmethod
-    def to_persian_digits(text):
-        persian_digits = "۰۱۲۳۴۵۶۷۸۹"
-        english_digits = "0123456789"
-        translation_table = str.maketrans(english_digits, persian_digits)
-        return str(text).translate(translation_table)
-
-    @staticmethod
-    def gregorian_to_jalali(gy, gm, gd):
-        g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-        gy -= 1600
-        gm -= 1
-        gd -= 1
-
-        g_day_no = 365 * gy + (gy + 3) // 4 - (gy + 99) // 100 + (gy + 399) // 400
-
-        for i in range(gm):
-            g_day_no += g_d_m[i + 1] - g_d_m[i]
-
-        if gm > 1 and ((gy % 4 == 0 and gy % 100 != 0) or (gy % 400 == 0)):
-            g_day_no += 1
-
-        g_day_no += gd
-        j_day_no = g_day_no - 79
-
-        j_np = j_day_no // 12053
-        j_day_no %= 12053
-
-        jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
-        j_day_no %= 1461
-
-        if j_day_no >= 366:
-            jy += (j_day_no - 1) // 365
-            j_day_no = (j_day_no - 1) % 365
-
-        for i in range(11):
-            days_in_month = 31 if i < 6 else 30
-            if j_day_no < days_in_month:
-                jm = i + 1
-                jd = j_day_no + 1
-                break
-            j_day_no -= days_in_month
-        else:
-            jm = 12
-            jd = j_day_no + 1
-
-        return jy, jm, jd
-
-    @staticmethod
-    def convert_date(date_str):
-        try:
-            parts = date_str.replace('/', '-').split('-')
-            if len(parts) == 3 and int(parts[0]) > 1900:
-                jy, jm, jd = PersianClassReportRenderer.gregorian_to_jalali(int(parts[0]), int(parts[1]), int(parts[2]))
-                return f"{jy}/{jm:02d}/{jd:02d}"
-        except Exception:
-            pass
-        return date_str
-
-    @staticmethod
     def render(report_data):
         proj_name = report_data['project_name']
-        raw_date = PersianClassReportRenderer.convert_date(report_data['session_date'])
-        sess_date = PersianClassReportRenderer.to_persian_digits(raw_date)
+        raw_date = normalize_date_to_jalali(report_data['session_date']) or get_today_jalali_str()
+        sess_date = to_persian_digits(raw_date)
         sess_day = report_data.get('session_day', '')
         arshad = report_data['arshad']
         ordered_units = report_data['ordered_units']
@@ -188,7 +148,7 @@ class PersianClassReportRenderer:
         if arshad:
             lines.append(f"*ارشد:* {format_staff(arshad)}")
             if arshad.get('phone'):
-                phone_fa = PersianClassReportRenderer.to_persian_digits(arshad.get('phone', ''))
+                phone_fa = to_persian_digits(arshad.get('phone', ''))
                 lines.append(phone_fa)
         else:
             lines.append("*ارشد:* ")
@@ -321,7 +281,7 @@ class ReportManager:
         }
 
     def log_staff_action(self, project_id, user_id, action_type):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = get_today_jalali_str()
         now_iso = datetime.now()
         conn = self.db.get_connection()
         try:
@@ -337,7 +297,7 @@ class ReportManager:
             conn.close()
 
     def get_staff_performance_report(self, project_id=None, date_str=None):
-        target_date = date_str or datetime.now().strftime("%Y-%m-%d")
+        target_date = normalize_date_to_jalali(date_str) if date_str else get_today_jalali_str()
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()

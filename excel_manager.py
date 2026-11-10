@@ -1,3 +1,8 @@
+from utils import normalize_persian, get_iran_now, normalize_date_to_jalali, get_today_jalali_str, get_persian_weekday
+from staff_manager import staff_manager
+from project_manager import project_manager
+from db_manager import db_instance
+from config import PROJECT_FILES_DIR, EXCEL_BACKUPS_DIR, BASE_PATH
 import os
 import sys
 import logging
@@ -11,12 +16,6 @@ from openpyxl.utils import get_column_letter
 _root = os.path.dirname(os.path.abspath(__file__))
 if _root not in sys.path:
     sys.path.insert(0, _root)
-
-from config import PROJECT_FILES_DIR, EXCEL_BACKUPS_DIR, BASE_PATH
-from db_manager import db_instance
-from project_manager import project_manager
-from staff_manager import staff_manager
-from utils import normalize_persian, get_iran_now, normalize_date_to_jalali
 
 
 def _clean_cell_str(val):
@@ -64,7 +63,8 @@ class ExcelManager:
         default_template = os.path.join(BASE_PATH, "قالب اکسل پروژه.xlsx")
         if not os.path.exists(default_target) and os.path.exists(default_template):
             shutil.copy2(default_template, default_target)
-            project_manager.update_project_excel_path(project_id, default_target)
+            project_manager.update_project_excel_path(
+                project_id, default_target)
 
         return default_target
 
@@ -81,7 +81,8 @@ class ExcelManager:
             try:
                 prefix = f"project_{project_id}_backup_"
                 files = sorted(
-                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.startswith(prefix) and f.endswith(".xlsx")],
+                    [os.path.join(category_dir, f) for f in os.listdir(
+                        category_dir) if f.startswith(prefix) and f.endswith(".xlsx")],
                     key=os.path.getmtime
                 )
                 if len(files) > 15:
@@ -91,7 +92,8 @@ class ExcelManager:
                         except OSError:
                             pass
             except Exception as ret_err:
-                logging.warning(f"Excel backup retention cleanup notice: {ret_err}")
+                logging.warning(
+                    f"Excel backup retention cleanup notice: {ret_err}")
 
             return target_path
         return None
@@ -107,7 +109,8 @@ class ExcelManager:
                 return True
 
             exclude_sheets = ['تامین نیرو', 'چارت', 'داشبورد']
-            candidate_sheets = [s for s in wb.sheetnames if s not in exclude_sheets]
+            candidate_sheets = [
+                s for s in wb.sheetnames if s not in exclude_sheets]
 
             if candidate_sheets:
                 source_sheet_name = candidate_sheets[-1]
@@ -126,8 +129,10 @@ class ExcelManager:
                     _clean_cell_str(new_ws.cell(row=1, column=c).value): c
                     for c in range(1, 100) if new_ws.cell(row=1, column=c).value
                 }
-                clear_cols = ["وضعیت حضور", "وضعیت کارت", "پیگیری تاخیر", "توضیحات"]
-                col_indices_to_clear = [header_map[col] for col in clear_cols if col in header_map]
+                clear_cols = ["وضعیت حضور", "وضعیت کارت",
+                              "پیگیری تاخیر", "توضیحات"]
+                col_indices_to_clear = [header_map[col]
+                                        for col in clear_cols if col in header_map]
 
                 for r_idx in range(2, new_ws.max_row + 1):
                     for c_idx in col_indices_to_clear:
@@ -144,8 +149,10 @@ class ExcelManager:
                 new_ws.append(headers)
 
                 header_font = Font(bold=True)
-                header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-                header_align = Alignment(horizontal="center", vertical="center")
+                header_fill = PatternFill(
+                    start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+                header_align = Alignment(
+                    horizontal="center", vertical="center")
 
                 for col_idx, cell in enumerate(new_ws[1], start=1):
                     cell.font = header_font
@@ -178,9 +185,10 @@ class ExcelManager:
         for s in all_staff:
             # کلید یکتا بر اساس نام نرمال‌شده + واحد نرمال‌شده + بخش نرمال‌شده
             sec_clean = _clean_cell_str(s['section'])
-            if sec_clean == '-':
+            if sec_clean in ('-', 'عمومی', 'اصلی', _clean_cell_str(s['unit'])):
                 sec_clean = ''
-            key_full = (_norm_key(s['name']), _norm_key(s['unit']), _norm_key(sec_clean))
+            key_full = (_norm_key(s['name']), _norm_key(
+                s['unit']), _norm_key(sec_clean))
             key_no_sec = (_norm_key(s['name']), _norm_key(s['unit']), '')
 
             primary_id = None
@@ -236,13 +244,17 @@ class ExcelManager:
                     da['section_snapshot'] or '', da['section_snapshot'] or '',
                     project_id, da['session_id'], prim_id
                 ))
-            cursor.execute("DELETE FROM attendance WHERE project_id = %s AND staff_id = %s", (project_id, dup_id))
-            cursor.execute("DELETE FROM schedule_staff WHERE staff_id = %s", (dup_id,))
-            cursor.execute("DELETE FROM project_staff WHERE id = %s", (dup_id,))
+            cursor.execute(
+                "DELETE FROM attendance WHERE project_id = %s AND staff_id = %s", (project_id, dup_id))
+            cursor.execute(
+                "DELETE FROM schedule_staff WHERE staff_id = %s", (dup_id,))
+            cursor.execute(
+                "DELETE FROM project_staff WHERE id = %s", (dup_id,))
 
     def import_project_excel(self, project_id, uploaded_file_path):
         if uploaded_file_path.lower().endswith('.xls') and not uploaded_file_path.lower().endswith('.xlsx'):
-            raise ValueError("فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
+            raise ValueError(
+                "فرمت .xls قدیمی پشتیبانی نمی‌شود. لطفاً فایل اکسل را با فرمت مدرن .xlsx ارسال فرمایید.")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as staging_file:
             staging_path = staging_file.name
@@ -252,26 +264,30 @@ class ExcelManager:
             wb = openpyxl.load_workbook(staging_path, data_only=True)
             if len(wb.sheetnames) == 0:
                 wb.close()
-                raise ValueError("فایل اکسل ارسالی فاقد هرگونه برگه (Sheet) می‌باشد.")
+                raise ValueError(
+                    "فایل اکسل ارسالی فاقد هرگونه برگه (Sheet) می‌باشد.")
         except Exception as e:
             if os.path.exists(staging_path):
                 os.remove(staging_path)
             raise ValueError(f"فایل اکسل نامعتبر یا غیرقابل خواندن است: {e}")
 
         exclude_sheets = ['تامین نیرو', 'چارت', 'داشبورد']
-        valid_sheets = [s for s in wb.sheetnames if _clean_cell_str(s) not in exclude_sheets]
+        valid_sheets = [s for s in wb.sheetnames if _clean_cell_str(
+            s) not in exclude_sheets]
 
         db_backup_path = db_instance.backup_database(label="pre_update")
         if not db_backup_path or not db_instance.verify_backup_integrity(db_backup_path):
             wb.close()
             if os.path.exists(staging_path):
                 os.remove(staging_path)
-            raise RuntimeError("امکان ایجاد نسخه پشتیبان معتبر از پایگاه داده قبل از شروع عملیات وجود ندارد.")
+            raise RuntimeError(
+                "امکان ایجاد نسخه پشتیبان معتبر از پایگاه داده قبل از شروع عملیات وجود ندارد.")
 
         proj_excel_path = self.get_project_excel_path(project_id)
         excel_backup_path = None
         if os.path.exists(proj_excel_path):
-            excel_backup_path = self.backup_project_excel(project_id, label="pre_update")
+            excel_backup_path = self.backup_project_excel(
+                project_id, label="pre_update")
 
         conn = self.db.get_connection()
         now_iso = get_iran_now()
@@ -280,29 +296,38 @@ class ExcelManager:
             cursor = conn.cursor()
             with conn:
                 # ۱. ابتدا پاکسازی هرگونه رکورد تکراری قدیمی در این پروژه
-                self.deduplicate_project_staff_and_attendance(project_id, cursor)
+                self.deduplicate_project_staff_and_attendance(
+                    project_id, cursor)
 
                 if "چارت" in wb.sheetnames:
                     ws_chart = wb["چارت"]
                     pairs = []
                     for r in range(2, ws_chart.max_row + 1):
-                        u = _clean_cell_str(ws_chart.cell(row=r, column=1).value)
-                        s = _clean_cell_str(ws_chart.cell(row=r, column=2).value)
+                        u = _clean_cell_str(
+                            ws_chart.cell(row=r, column=1).value)
+                        s = _clean_cell_str(
+                            ws_chart.cell(row=r, column=2).value)
                         if u:
                             pairs.append((u, s, r - 1))
-                    project_manager.set_project_org_chart(project_id, pairs, cursor=cursor)
+                    project_manager.set_project_org_chart(
+                        project_id, pairs, cursor=cursor)
 
                 if "تامین نیرو" in wb.sheetnames:
                     ws_sh = wb["تامین نیرو"]
-                    cursor.execute("DELETE FROM shortages WHERE project_id = %s AND status = 'تامین نشده'", (project_id,))
+                    cursor.execute(
+                        "DELETE FROM shortages WHERE project_id = %s AND status = 'تامین نشده'", (project_id,))
                     for r in range(2, ws_sh.max_row + 1):
                         u = _clean_cell_str(ws_sh.cell(row=r, column=2).value)
                         s = _clean_cell_str(ws_sh.cell(row=r, column=3).value)
                         st = _clean_cell_str(ws_sh.cell(row=r, column=4).value)
-                        assigned_name = _clean_cell_str(ws_sh.cell(row=r, column=5).value)
-                        phone = _clean_cell_str(ws_sh.cell(row=r, column=6).value)
-                        desc = _clean_cell_str(ws_sh.cell(row=r, column=7).value)
-                        target_grp = _clean_cell_str(ws_sh.cell(row=r, column=8).value)
+                        assigned_name = _clean_cell_str(
+                            ws_sh.cell(row=r, column=5).value)
+                        phone = _clean_cell_str(
+                            ws_sh.cell(row=r, column=6).value)
+                        desc = _clean_cell_str(
+                            ws_sh.cell(row=r, column=7).value)
+                        target_grp = _clean_cell_str(
+                            ws_sh.cell(row=r, column=8).value)
                         if u:
                             cursor.execute("""
                             INSERT INTO shortages (project_id, unit, section, count, target_group, description, status, assigned_name, phone, _excel_row, is_notified, created_at)
@@ -313,16 +338,19 @@ class ExcelManager:
                     clean_sheet_name = _clean_cell_str(sheet_name)
 
                     sched_id = None
-                    tag_match = re.search(r'\[(?:ID|SCHED)[-:]\s*(\d+)\]', clean_sheet_name, re.IGNORECASE)
+                    tag_match = re.search(
+                        r'\[(?:ID|SCHED)[-:]\s*(\d+)\]', clean_sheet_name, re.IGNORECASE)
                     if tag_match:
                         cand_id = int(tag_match.group(1))
-                        cursor.execute("SELECT id FROM schedules WHERE id = %s AND project_id = %s AND is_active = TRUE", (cand_id, project_id))
+                        cursor.execute(
+                            "SELECT id FROM schedules WHERE id = %s AND project_id = %s AND is_active = TRUE", (cand_id, project_id))
                         row = cursor.fetchone()
                         if row:
                             sched_id = cand_id
 
                     if sched_id is None:
-                        cursor.execute("SELECT id FROM schedules WHERE project_id = %s AND name = %s AND is_active = TRUE", (project_id, clean_sheet_name))
+                        cursor.execute(
+                            "SELECT id FROM schedules WHERE project_id = %s AND name = %s AND is_active = TRUE", (project_id, clean_sheet_name))
                         row = cursor.fetchone()
                         if row:
                             sched_id = row['id']
@@ -341,10 +369,12 @@ class ExcelManager:
                             sched_id = s_row['schedule_id']
                             session_id = s_row['id']
 
-                    cursor.execute("SELECT type FROM projects WHERE id = %s", (project_id,))
+                    cursor.execute(
+                        "SELECT type, activation_time, end_time, recurring_days FROM projects WHERE id = %s", (project_id,))
                     p_type_row = cursor.fetchone()
                     if p_type_row and p_type_row['type'] == 'کلاس' and sched_id is None:
-                        cursor.execute("SELECT id FROM schedules WHERE project_id = %s AND is_active = TRUE ORDER BY id ASC LIMIT 1", (project_id,))
+                        cursor.execute(
+                            "SELECT id FROM schedules WHERE project_id = %s AND is_active = TRUE ORDER BY id ASC LIMIT 1", (project_id,))
                         fallback_sc = cursor.fetchone()
                         if fallback_sc:
                             sched_id = fallback_sc['id']
@@ -366,12 +396,31 @@ class ExcelManager:
                             if sched_id is None:
                                 sched_id = sess_row.get('schedule_id')
                         else:
-                            cursor.execute("""
-                            INSERT INTO sessions (project_id, schedule_id, name, session_date, time_str, day_of_week, status, created_at)
-                            VALUES (%s, %s, %s, '', '', '', 'SCHEDULED', %s)
-                            RETURNING id;
-                            """, (project_id, sched_id, clean_sheet_name, now_iso.isoformat()))
-                            session_id = cursor.fetchone()['id']
+                            # اگر شیت با نام مثلاً "روز 1" آپلود شده ولی در پروژه کلاسی "جلسه 1" داریم، به اولین جلسه موجود متصل شود
+                            cursor.execute(
+                                "SELECT id, schedule_id FROM sessions WHERE project_id = %s AND status != 'CANCELLED' ORDER BY id ASC LIMIT 1",
+                                (project_id,)
+                            )
+                            first_existing_sess = cursor.fetchone()
+                            if first_existing_sess and len(valid_sheets) == 1:
+                                session_id = first_existing_sess['id']
+                                if sched_id is None:
+                                    sched_id = first_existing_sess.get(
+                                        'schedule_id')
+                            else:
+                                default_j_date = get_today_jalali_str(now_iso)
+                                default_day = (p_type_row.get(
+                                    'recurring_days') if p_type_row else '') or get_persian_weekday(now_iso)
+                                default_stime = (p_type_row.get(
+                                    'activation_time') if p_type_row else '') or '07:00'
+                                default_etime = (p_type_row.get(
+                                    'end_time') if p_type_row else '') or '23:00'
+                                cursor.execute("""
+                                INSERT INTO sessions (project_id, schedule_id, name, session_date, time_str, end_time_str, day_of_week, status, created_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, 'SCHEDULED', %s)
+                                RETURNING id;
+                                """, (project_id, sched_id, clean_sheet_name, default_j_date, default_stime, default_etime, default_day, now_iso.isoformat()))
+                                session_id = cursor.fetchone()['id']
 
                     ws = wb[sheet_name]
                     # نقشه هوشمند سرستون‌ها با نرمال‌سازی حروف فارسی/عربی و فاصله‌ها
@@ -400,26 +449,32 @@ class ExcelManager:
                                     return col_i
                         return None
 
-                    col_name = get_col_idx("نام و نام خانوادگی", "نام و نام خانوادگي", "نام", "نام نیرو")
-                    col_code = get_col_idx("کد پرسنلی", "کد نیرو", "شناسه نیرو")
+                    col_name = get_col_idx(
+                        "نام و نام خانوادگی", "نام و نام خانوادگي", "نام", "نام نیرو")
+                    col_code = get_col_idx(
+                        "کد پرسنلی", "کد نیرو", "شناسه نیرو")
                     col_unit = get_col_idx("واحد", "نام واحد")
                     col_sec = get_col_idx("بخش", "زیرواحد", "بخش / زیرواحد")
                     col_pos = get_col_idx("سمت", "مسئولیت", "نقش")
                     col_card_title = get_col_idx("عنوان کارت", "کارت")
-                    col_phone = get_col_idx("شماره تماس", "موبایل", "تلفن", "شماره همراه")
+                    col_phone = get_col_idx(
+                        "شماره تماس", "موبایل", "تلفن", "شماره همراه")
                     col_shift = get_col_idx("ساعت حضور", "ساعت شیفت", "شیفت")
                     col_late = get_col_idx("پیگیری تاخیر", "پیگیری")
                     col_desc = get_col_idx("توضیحات")
                     col_card_st = get_col_idx("وضعیت کارت")
                     col_att_st = get_col_idx("وضعیت حضور", "حضور و غیاب")
                     col_gender = get_col_idx("جنسیت")
-                    col_multi = get_col_idx("فعال در چند بخش؟", "فعال در چند بخش")
+                    col_multi = get_col_idx(
+                        "فعال در چند بخش؟", "فعال در چند بخش")
 
                     sheet_staff_ids = set()
 
                     # بارگذاری لیست فعلی کارکنان پروژه برای تطبیق هوشمند بدون کوئری اضافی
-                    cursor.execute("SELECT id, staff_code, name, unit, section, phone FROM project_staff WHERE project_id = %s ORDER BY id ASC", (project_id,))
-                    existing_project_staff = [dict(r) for r in cursor.fetchall()]
+                    cursor.execute(
+                        "SELECT id, staff_code, name, unit, section, phone FROM project_staff WHERE project_id = %s ORDER BY id ASC", (project_id,))
+                    existing_project_staff = [
+                        dict(r) for r in cursor.fetchall()]
 
                     for r_idx in range(2, ws.max_row + 1):
                         def read_cell(c_idx):
@@ -435,11 +490,12 @@ class ExcelManager:
                         unit = read_cell(col_unit)
                         section = read_cell(col_sec)
 
-                        if section in ('None', 'nan', '-'):
+                        if section in ('None', 'nan', '-', 'عمومی', 'اصلی') or section == unit:
                             section = ''
 
                         pos = read_cell(col_pos) or "نیرو"
-                        card_title = read_cell(col_card_title) or section or unit
+                        card_title = read_cell(
+                            col_card_title) or section or unit
                         phone = read_cell(col_phone)
                         shift_time = read_cell(col_shift)
                         late_trk = read_cell(col_late)
@@ -478,7 +534,6 @@ class ExcelManager:
                             ]
                             if len(same_name_unit) == 1:
                                 ex_cand = same_name_unit[0]
-                                # اگر رکورد قبلی بخش نداشت یا در این شیت هنوز استفاده نشده، همان رکورد قبلی است
                                 if not _norm_key(ex_cand.get('section')) or ex_cand['id'] not in sheet_staff_ids:
                                     matched_staff_id = ex_cand['id']
 
@@ -499,7 +554,6 @@ class ExcelManager:
                                 _excel_row = %s
                             WHERE id = %s
                             """, (name, unit, section, phone, shift_time, gender, pos, card_title, is_multi, r_idx, staff_id))
-                            # آپدیت کش محلی
                             for ex in existing_project_staff:
                                 if ex['id'] == staff_id:
                                     ex['name'] = name
@@ -515,7 +569,8 @@ class ExcelManager:
                             staff_id = cursor.fetchone()['id']
                             if not staff_code:
                                 auto_code = f"STF-{staff_id:05d}"
-                                cursor.execute("UPDATE project_staff SET staff_code = %s WHERE id = %s", (auto_code, staff_id))
+                                cursor.execute(
+                                    "UPDATE project_staff SET staff_code = %s WHERE id = %s", (auto_code, staff_id))
                                 staff_code = auto_code
                             existing_project_staff.append({
                                 'id': staff_id, 'staff_code': staff_code,
@@ -584,10 +639,67 @@ class ExcelManager:
                             """, [session_id, sched_id] + list(sheet_staff_ids))
 
                 # پاکسازی نهایی هرگونه نیروی تکراری احتمالی
-                self.deduplicate_project_staff_and_attendance(project_id, cursor)
+                self.deduplicate_project_staff_and_attendance(
+                    project_id, cursor)
+
+                # همگام‌سازی کادر فعال با سایر جلسات پروژه تا با تغییر جلسه، لیست حضور و غیاب و گزارش متنی در جلسات بعدی خالی نماند
+                cursor.execute(
+                    "SELECT id, schedule_id FROM sessions WHERE project_id = %s AND status != 'CANCELLED'",
+                    (project_id,)
+                )
+                all_proj_sessions = cursor.fetchall()
+                for s_item in all_proj_sessions:
+                    t_sid = s_item['id']
+                    t_sched = s_item['schedule_id']
+                    roster_rows = []
+                    if t_sched is not None:
+                        cursor.execute("""
+                        SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender,
+                               ps.phone, ps.card_title, ps.shift_time, ps.is_multi_section, ps.staff_code
+                        FROM schedule_staff ss
+                        JOIN project_staff ps ON ss.staff_id = ps.id
+                        WHERE ss.schedule_id = %s AND ss.is_active = TRUE AND ps.is_active = TRUE
+                        ORDER BY ps.id ASC
+                        """, (t_sched,))
+                        roster_rows = cursor.fetchall()
+                    if not roster_rows:
+                        cursor.execute("""
+                        SELECT id, name, unit, section, position, gender,
+                               phone, card_title, shift_time, is_multi_section, staff_code
+                        FROM project_staff
+                        WHERE project_id = %s AND is_active = TRUE
+                        ORDER BY id ASC
+                        """, (project_id,))
+                        roster_rows = cursor.fetchall()
+
+                    for st_row in roster_rows:
+                        cursor.execute("""
+                        INSERT INTO attendance (
+                            project_id, session_id, staff_id, status, card_status,
+                            staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                            phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, '', '', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT(project_id, session_id, staff_id) DO UPDATE SET
+                            staff_name_snapshot = EXCLUDED.staff_name_snapshot,
+                            unit_snapshot = EXCLUDED.unit_snapshot,
+                            section_snapshot = EXCLUDED.section_snapshot,
+                            position_snapshot = EXCLUDED.position_snapshot,
+                            gender_snapshot = COALESCE(NULLIF(EXCLUDED.gender_snapshot, ''), attendance.gender_snapshot),
+                            phone_snapshot = COALESCE(NULLIF(EXCLUDED.phone_snapshot, ''), attendance.phone_snapshot),
+                            card_title_snapshot = COALESCE(NULLIF(EXCLUDED.card_title_snapshot, ''), attendance.card_title_snapshot),
+                            shift_time_snapshot = COALESCE(NULLIF(EXCLUDED.shift_time_snapshot, ''), attendance.shift_time_snapshot);
+                        """, (
+                            project_id, t_sid, st_row['id'],
+                            st_row['name'], st_row['unit'], st_row['section'], st_row['position'], st_row['gender'],
+                            st_row['phone'], st_row['card_title'], st_row['shift_time'], st_row['is_multi_section'], st_row['staff_code'],
+                            now_iso
+                        ))
 
         except Exception as err:
-            logging.error(f"Excel import DB transaction failed and rolled back: {err}")
+            logging.error(
+                f"Excel import DB transaction failed and rolled back: {err}")
             if os.path.exists(staging_path):
                 os.remove(staging_path)
             raise err
@@ -599,16 +711,19 @@ class ExcelManager:
             shutil.copy2(staging_path, proj_excel_path)
             chk_wb = openpyxl.load_workbook(proj_excel_path, data_only=True)
             chk_wb.close()
-            project_manager.update_project_excel_path(project_id, proj_excel_path)
+            project_manager.update_project_excel_path(
+                project_id, proj_excel_path)
         except Exception as fs_err:
-            logging.critical(f"Failed to copy or verify staging Excel at destination: {fs_err}. Starting recovery.")
+            logging.critical(
+                f"Failed to copy or verify staging Excel at destination: {fs_err}. Starting recovery.")
             if db_backup_path and os.path.exists(db_backup_path):
                 db_instance.restore_backup(db_backup_path)
             if excel_backup_path and os.path.exists(excel_backup_path):
                 shutil.copy2(excel_backup_path, proj_excel_path)
             elif os.path.exists(proj_excel_path):
                 os.remove(proj_excel_path)
-            raise RuntimeError(f"خطا در جایگزینی و اعتبارسنجی فایل اکسل. کلیه تغییرات دیتابیس و فایل به وضعیت قبل بازگردانی شدند: {fs_err}")
+            raise RuntimeError(
+                f"خطا در جایگزینی و اعتبارسنجی فایل اکسل. کلیه تغییرات دیتابیس و فایل به وضعیت قبل بازگردانی شدند: {fs_err}")
         finally:
             if os.path.exists(staging_path):
                 os.remove(staging_path)
@@ -625,7 +740,8 @@ class ExcelManager:
         wb = openpyxl.load_workbook(excel_path, data_only=False)
 
         try:
-            sessions = attendance_manager.list_sessions(project_id, include_cancelled=False)
+            sessions = attendance_manager.list_sessions(
+                project_id, include_cancelled=False)
             for sess in sessions:
                 sheet_name = sess['name']
                 if sheet_name not in wb.sheetnames:
@@ -636,8 +752,10 @@ class ExcelManager:
                         continue
 
                 ws = wb[sheet_name]
-                header_map = {_clean_cell_str(ws.cell(row=1, column=c).value): c for c in range(1, 100) if ws.cell(row=1, column=c).value}
-                att_records = attendance_manager.get_session_attendance(project_id, sess['id'])
+                header_map = {_clean_cell_str(ws.cell(row=1, column=c).value): c for c in range(
+                    1, 100) if ws.cell(row=1, column=c).value}
+                att_records = attendance_manager.get_session_attendance(
+                    project_id, sess['id'])
 
                 row_lookup = {}
                 name_col = header_map.get("نام و نام خانوادگی")
@@ -645,9 +763,12 @@ class ExcelManager:
                 sec_col = header_map.get("بخش")
                 if name_col:
                     for ri in range(2, ws.max_row + 1):
-                        n_val = _norm_key(ws.cell(row=ri, column=name_col).value)
-                        u_val = _norm_key(ws.cell(row=ri, column=unit_col).value) if unit_col else ""
-                        s_val = _norm_key(ws.cell(row=ri, column=sec_col).value) if sec_col else ""
+                        n_val = _norm_key(
+                            ws.cell(row=ri, column=name_col).value)
+                        u_val = _norm_key(
+                            ws.cell(row=ri, column=unit_col).value) if unit_col else ""
+                        s_val = _norm_key(
+                            ws.cell(row=ri, column=sec_col).value) if sec_col else ""
                         if n_val:
                             row_lookup[(n_val, u_val, s_val)] = ri
                             if (n_val, u_val, "") not in row_lookup:
@@ -661,32 +782,62 @@ class ExcelManager:
                         raw_sec = ""
                     rec_section = _norm_key(raw_sec)
 
-                    r_idx = row_lookup.get((rec_name, rec_unit, rec_section)) or row_lookup.get((rec_name, rec_unit, ""))
+                    r_idx = row_lookup.get((rec_name, rec_unit, rec_section)) or row_lookup.get(
+                        (rec_name, rec_unit, ""))
                     if not r_idx:
                         r_idx = ws.max_row + 1
                         row_lookup[(rec_name, rec_unit, rec_section)] = r_idx
 
-                    if "نام و نام خانوادگی" in header_map: ws.cell(row=r_idx, column=header_map["نام و نام خانوادگی"]).value = rec.get("name")
-                    if "کد پرسنلی" in header_map: ws.cell(row=r_idx, column=header_map["کد پرسنلی"]).value = rec.get("staff_code")
-                    if "واحد" in header_map: ws.cell(row=r_idx, column=header_map["واحد"]).value = rec.get("unit")
-                    if "بخش" in header_map: ws.cell(row=r_idx, column=header_map["بخش"]).value = raw_sec
-                    if "سمت" in header_map: ws.cell(row=r_idx, column=header_map["سمت"]).value = rec.get("position")
-                    if "عنوان کارت" in header_map: ws.cell(row=r_idx, column=header_map["عنوان کارت"]).value = rec.get("card_title")
-                    if "شماره تماس" in header_map: ws.cell(row=r_idx, column=header_map["شماره تماس"]).value = rec.get("phone")
-                    if "ساعت حضور" in header_map: ws.cell(row=r_idx, column=header_map["ساعت حضور"]).value = rec.get("shift_time")
-                    if "پیگیری تاخیر" in header_map: ws.cell(row=r_idx, column=header_map["پیگیری تاخیر"]).value = rec.get("late_tracking")
-                    if "توضیحات" in header_map: ws.cell(row=r_idx, column=header_map["توضیحات"]).value = rec.get("description")
-                    if "وضعیت کارت" in header_map: ws.cell(row=r_idx, column=header_map["وضعیت کارت"]).value = rec.get("card_status")
-                    if "وضعیت حضور" in header_map: ws.cell(row=r_idx, column=header_map["وضعیت حضور"]).value = rec.get("status")
-                    if "جنسیت" in header_map: ws.cell(row=r_idx, column=header_map["جنسیت"]).value = rec.get("gender")
-                    if "فعال در چند بخش؟" in header_map: ws.cell(row=r_idx, column=header_map["فعال در چند بخش؟"]).value = rec.get("is_multi_section")
+                    if "نام و نام خانوادگی" in header_map:
+                        ws.cell(row=r_idx, column=header_map["نام و نام خانوادگی"]).value = rec.get(
+                            "name")
+                    if "کد پرسنلی" in header_map:
+                        ws.cell(row=r_idx, column=header_map["کد پرسنلی"]).value = rec.get(
+                            "staff_code")
+                    if "واحد" in header_map:
+                        ws.cell(row=r_idx, column=header_map["واحد"]).value = rec.get(
+                            "unit")
+                    if "بخش" in header_map:
+                        ws.cell(
+                            row=r_idx, column=header_map["بخش"]).value = raw_sec
+                    if "سمت" in header_map:
+                        ws.cell(row=r_idx, column=header_map["سمت"]).value = rec.get(
+                            "position")
+                    if "عنوان کارت" in header_map:
+                        ws.cell(row=r_idx, column=header_map["عنوان کارت"]).value = rec.get(
+                            "card_title")
+                    if "شماره تماس" in header_map:
+                        ws.cell(row=r_idx, column=header_map["شماره تماس"]).value = rec.get(
+                            "phone")
+                    if "ساعت حضور" in header_map:
+                        ws.cell(row=r_idx, column=header_map["ساعت حضور"]).value = rec.get(
+                            "shift_time")
+                    if "پیگیری تاخیر" in header_map:
+                        ws.cell(row=r_idx, column=header_map["پیگیری تاخیر"]).value = rec.get(
+                            "late_tracking")
+                    if "توضیحات" in header_map:
+                        ws.cell(row=r_idx, column=header_map["توضیحات"]).value = rec.get(
+                            "description")
+                    if "وضعیت کارت" in header_map:
+                        ws.cell(row=r_idx, column=header_map["وضعیت کارت"]).value = rec.get(
+                            "card_status")
+                    if "وضعیت حضور" in header_map:
+                        ws.cell(row=r_idx, column=header_map["وضعیت حضور"]).value = rec.get(
+                            "status")
+                    if "جنسیت" in header_map:
+                        ws.cell(row=r_idx, column=header_map["جنسیت"]).value = rec.get(
+                            "gender")
+                    if "فعال در چند بخش؟" in header_map:
+                        ws.cell(row=r_idx, column=header_map["فعال در چند بخش؟"]).value = rec.get(
+                            "is_multi_section")
 
             if "تامین نیرو" in wb.sheetnames:
                 ws_sh = wb["تامین نیرو"]
                 conn = self.db.get_connection()
                 try:
                     cursor = conn.cursor()
-                    cursor.execute("SELECT * FROM shortages WHERE project_id = %s ORDER BY id ASC", (project_id,))
+                    cursor.execute(
+                        "SELECT * FROM shortages WHERE project_id = %s ORDER BY id ASC", (project_id,))
                     shortages = cursor.fetchall()
                 finally:
                     conn.close()

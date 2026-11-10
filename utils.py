@@ -10,7 +10,7 @@ except Exception:
 
 
 def get_iran_now():
-    """دریافت زمان دقیق فعلی به وقت ایران (بدون وابستگی به تایم‌زون سرور)"""
+    """دریافت زمان دقیق فعلی به وقت ایران"""
     return datetime.now(IRAN_TZ).replace(tzinfo=None)
 
 
@@ -60,28 +60,46 @@ def safe_markdown(text):
 
 
 def gregorian_to_jalali(gy, gm, gd):
-    """تبدیل دقیق تاریخ میلادی به شمسی (جلالی)"""
+    """الگوریتم استاندارد و بدون خطای تبدیل تاریخ میلادی به شمسی (جلالی)"""
     g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-    gy2 = gy + 1 if gm > 2 else gy
-    days = 355666 + (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100) + ((gy2 + 399) // 400) + gd + g_d_m[gm - 1]
-    jy = -1595 + (33 * (days // 12053))
-    days %= 12053
-    jy += 4 * (days // 1461)
-    days %= 1461
-    if days > 365:
-        jy += (days - 1) // 365
-        days = (days - 1) % 365
-    if days < 186:
-        jm = 1 + (days // 31)
-        jd = 1 + (days % 31)
+    gy -= 1600
+    gm -= 1
+    gd -= 1
+
+    g_day_no = 365 * gy + (gy + 3) // 4 - (gy + 99) // 100 + (gy + 399) // 400
+    for i in range(gm):
+        g_day_no += g_d_m[i + 1] - g_d_m[i]
+    if gm > 1 and ((gy % 4 == 0 and gy % 100 != 0) or (gy % 400 == 0)):
+        g_day_no += 1
+    g_day_no += gd
+
+    j_day_no = g_day_no - 79
+    j_np = j_day_no // 12053
+    j_day_no %= 12053
+
+    jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+    j_day_no %= 1461
+
+    if j_day_no >= 366:
+        jy += (j_day_no - 1) // 365
+        j_day_no = (j_day_no - 1) % 365
+
+    for i in range(11):
+        days_in_month = 31 if i < 6 else 30
+        if j_day_no < days_in_month:
+            jm = i + 1
+            jd = j_day_no + 1
+            break
+        j_day_no -= days_in_month
     else:
-        jm = 7 + ((days - 186) // 30)
-        jd = 1 + ((days - 186) % 30)
+        jm = 12
+        jd = j_day_no + 1
+
     return jy, jm, jd
 
 
 def jalali_to_gregorian(jy, jm, jd):
-    """تبدیل دقیق تاریخ شمسی (جلالی) به میلادی"""
+    """الگوریتم استاندارد تبدیل تاریخ شمسی (جلالی) به میلادی"""
     jy += 1595
     days = -355668 + (365 * jy) + ((jy // 33) * 8) + (((jy % 33) + 3) // 4) + jd + (31 * (jm - 1) if jm < 7 else ((jm - 7) * 30) + 186)
     gy = 400 * (days // 146097)
@@ -107,7 +125,7 @@ def jalali_to_gregorian(jy, jm, jd):
 
 
 def get_today_jalali_str(now=None):
-    """دریافت تاریخ امروز ایران به فرمت استاندارد شمسی YYYY/MM/DD (با ارقام انگلیسی برای مقایسه دیتابیس)"""
+    """دریافت تاریخ امروز ایران به فرمت استاندارد شمسی YYYY/MM/DD (با ارقام انگلیسی برای دیتابیس)"""
     if now is None:
         now = get_iran_now()
     jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
@@ -123,15 +141,22 @@ def get_today_gregorian_str(now=None):
 def normalize_date_to_jalali(date_str):
     """
     هر نوع رشته تاریخ (شمسی مثل 1405/7/1 یا 1405-07-01 یا میلادی مثل 2026-10-16)
-    را به فرمت استاندارد شمسی YYYY/MM/DD تبدیل می‌کند.
+    را تشخیص داده و همیشه به فرمت استاندارد شمسی YYYY/MM/DD برمی‌گرداند.
     """
     if not date_str:
         return ""
     clean = normalize_persian(str(date_str)).replace('-', '/').replace('.', '/').strip()
     match = re.match(r'^(\d{4})/(\d{1,2})/(\d{1,2})$', clean)
     if not match:
-        return clean
-    y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        # پشتیبانی از فرمت DD/MM/YYYY در صورتی که سال در انتها باشد
+        match_rev = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', clean)
+        if match_rev:
+            d, m, y = int(match_rev.group(1)), int(match_rev.group(2)), int(match_rev.group(3))
+        else:
+            return clean
+    else:
+        y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+
     if y >= 1900:
         jy, jm, jd = gregorian_to_jalali(y, m, d)
         return f"{jy:04d}/{jm:02d}/{jd:02d}"
@@ -148,7 +173,7 @@ def parse_any_date_to_datetime(date_str):
         return None
     y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
     try:
-        if y < 1600:
+        if 1300 <= y <= 1600:
             gy, gm, gd = jalali_to_gregorian(y, m, d)
             return datetime(gy, gm, gd)
         return datetime(y, m, d)
@@ -195,7 +220,6 @@ def is_time_in_window(start_time_str, end_time_str, now=None):
         if start_mins <= end_mins:
             return start_mins <= now_mins <= end_mins
         else:
-            # شیفت شبانه که از نیمه‌شب رد می‌شود (مثلاً 20:00 تا 02:00)
             return now_mins >= start_mins or now_mins <= end_mins
     elif start_mins is not None:
         return now_mins >= start_mins

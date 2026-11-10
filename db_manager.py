@@ -7,6 +7,7 @@ import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 from config import PG_HOST, PG_USER, PG_PASS, PG_DB, PG_PORT, SUPER_ADMINS, LOGS_DIR, DB_BACKUPS_DIR
+from utils import normalize_date_to_jalali
 
 log_file = os.path.join(LOGS_DIR, "db_manager.log")
 logging.basicConfig(
@@ -22,7 +23,6 @@ class DatabaseUnavailableError(Exception):
 
 class PostgresConnectionWrapper:
     """پوششی ایمن برای مدیریت اتصال‌ها، جلوگیری از نشت کانکشن و بازگرداندن تضمینی به Pool"""
-
     def __init__(self, conn, pool):
         self.conn = conn
         self.pool = pool
@@ -78,7 +78,7 @@ class PostgresConnectionWrapper:
 
 
 class DatabaseManager:
-    CURRENT_SCHEMA_VERSION = 10
+    CURRENT_SCHEMA_VERSION = 11
 
     def __init__(self):
         self.pool = None
@@ -114,18 +114,14 @@ class DatabaseManager:
                     keepalives_count=5
                 )
                 self.active_host = host_cand
-                logging.info(
-                    f"Connected to PostgreSQL successfully on host '{host_cand}'")
+                logging.info(f"Connected to PostgreSQL successfully on host '{host_cand}'")
                 return
             except Exception as e:
                 last_err = e
-                logging.warning(
-                    f"PostgreSQL connection attempt on host '{host_cand}' failed: {e}")
+                logging.warning(f"PostgreSQL connection attempt on host '{host_cand}' failed: {e}")
 
-        logging.critical(
-            f"Failed to connect to PostgreSQL on all candidate hosts: {last_err}")
-        raise DatabaseUnavailableError(
-            f"PostgreSQL is inaccessible: {last_err}")
+        logging.critical(f"Failed to connect to PostgreSQL on all candidate hosts: {last_err}")
+        raise DatabaseUnavailableError(f"PostgreSQL is inaccessible: {last_err}")
 
     def get_connection(self):
         for attempt in range(3):
@@ -152,15 +148,13 @@ class DatabaseManager:
                 conn.autocommit = False
                 return PostgresConnectionWrapper(conn, self.pool)
             except Exception as e:
-                logging.warning(
-                    f"Connection pool attempt {attempt + 1} failed: {e}")
+                logging.warning(f"Connection pool attempt {attempt + 1} failed: {e}")
                 time.sleep(0.5)
                 try:
                     self._init_pool()
                 except Exception:
                     pass
-        raise DatabaseUnavailableError(
-            "Failed to obtain a healthy database connection after retries.")
+        raise DatabaseUnavailableError("Failed to obtain a healthy database connection after retries.")
 
     def get_sqlite_connection(self):
         return self.get_connection()
@@ -188,13 +182,11 @@ class DatabaseManager:
                 '-f', target_path,
                 str(PG_DB or 'flowpla2_bale_bot')
             ]
-            subprocess.run(cmd, env=env, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             try:
                 files = sorted(
-                    [os.path.join(category_dir, f) for f in os.listdir(
-                        category_dir) if f.endswith(".sql")],
+                    [os.path.join(category_dir, f) for f in os.listdir(category_dir) if f.endswith(".sql")],
                     key=os.path.getmtime
                 )
                 if len(files) > 15:
@@ -205,8 +197,7 @@ class DatabaseManager:
 
             return target_path
         except Exception as e:
-            logging.warning(
-                f"pg_dump command failed (Expected on shared host): {e}")
+            logging.warning(f"pg_dump command failed (Expected on shared host): {e}")
             return "POSTGRES_NATIVE_TRANSACTION_FALLBACK"
 
     def verify_backup_integrity(self, backup_path):
@@ -226,17 +217,13 @@ class DatabaseManager:
                 '-U', str(PG_USER or 'flowpla2_fazele'), '-d', 'postgres',
                 '-c', f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{PG_DB or 'flowpla2_bale_bot'}' AND pid <> pg_backend_pid();"
             ]
-            subprocess.run(term_cmd, env=env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(term_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             cmd = [
-                'pg_restore', '-h', self.active_host, '-p', str(
-                    PG_PORT or '5432'),
-                '-U', str(PG_USER or 'flowpla2_fazele'), '-d', str(
-                    PG_DB or 'flowpla2_bale_bot'), '-c', backup_path
+                'pg_restore', '-h', self.active_host, '-p', str(PG_PORT or '5432'),
+                '-U', str(PG_USER or 'flowpla2_fazele'), '-d', str(PG_DB or 'flowpla2_bale_bot'), '-c', backup_path
             ]
-            subprocess.run(cmd, env=env, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception as e:
             logging.error(f"Postgres restore failed: {e}")
@@ -423,7 +410,6 @@ class DatabaseManager:
             );
             """)
 
-            # مهاجرت خودکار ستون‌های جدید زمان‌بندی برای دیتابیس‌های موجود بدون از دست رفتن اطلاعات
             migrations = [
                 "ALTER TABLE projects ADD COLUMN IF NOT EXISTS end_time TEXT DEFAULT '23:00';",
                 "ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_schedule_enabled BOOLEAN DEFAULT TRUE;",
@@ -435,21 +421,35 @@ class DatabaseManager:
             for mig_sql in migrations:
                 cursor.execute(mig_sql)
 
+            # تبدیل خودکار تمام تاریخ‌های میلادی موجود در دیتابیس به تاریخ استاندارد شمسی
+            cursor.execute("SELECT id, session_date FROM sessions WHERE session_date IS NOT NULL AND session_date != ''")
+            for s_row in cursor.fetchall():
+                orig_d = s_row['session_date']
+                jal_d = normalize_date_to_jalali(orig_d)
+                if jal_d and jal_d != orig_d:
+                    cursor.execute("UPDATE sessions SET session_date = %s WHERE id = %s", (jal_d, s_row['id']))
+
+            cursor.execute("SELECT id, start_date, end_date FROM projects")
+            for p_row in cursor.fetchall():
+                s_orig = p_row['start_date'] or ''
+                e_orig = p_row['end_date'] or ''
+                s_jal = normalize_date_to_jalali(s_orig) if s_orig else ''
+                e_jal = normalize_date_to_jalali(e_orig) if e_orig else ''
+                if s_jal != s_orig or e_jal != e_orig:
+                    cursor.execute("UPDATE projects SET start_date = %s, end_date = %s WHERE id = %s", (s_jal, e_jal, p_row['id']))
+
             indexes = [
                 ("idx_staff_project_active", "project_staff (project_id, is_active)"),
                 ("idx_staff_project_phone", "project_staff (project_id, phone)"),
-                ("idx_schedule_staff_lookup",
-                 "schedule_staff (schedule_id, staff_id, is_active)"),
-                ("idx_attendance_lookup",
-                 "attendance (project_id, session_id, staff_id)"),
+                ("idx_schedule_staff_lookup", "schedule_staff (schedule_id, staff_id, is_active)"),
+                ("idx_attendance_lookup", "attendance (project_id, session_id, staff_id)"),
                 ("idx_sessions_project", "sessions (project_id)"),
                 ("idx_shortages_project", "shortages (project_id, status)"),
                 ("idx_project_users_uid", "project_users (user_id)"),
                 ("idx_staff_logs_date", "staff_logs (log_date, project_id)")
             ]
             for idx_name, idx_def in indexes:
-                cursor.execute(
-                    f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_def}")
 
             now_iso = datetime.now()
             for uid in SUPER_ADMINS:

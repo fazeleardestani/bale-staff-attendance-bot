@@ -78,7 +78,7 @@ class AttendanceManager:
 
             now_iso = get_iran_now().isoformat()
             raw_date_str = str(session_date or '').strip()
-            date_str = normalize_date_to_jalali(raw_date_str) if raw_date_str else ''
+            date_str = normalize_date_to_jalali(raw_date_str) if raw_date_str else get_today_jalali_str()
 
             if schedule_id is not None and date_str:
                 cursor.execute("""
@@ -109,12 +109,8 @@ class AttendanceManager:
                 FROM schedule_staff ss
                 JOIN project_staff ps ON ss.staff_id = ps.id
                 WHERE ss.schedule_id = %s AND ss.is_active = TRUE AND ps.is_active = TRUE
-                  AND (ss.start_session_id IS NULL OR ss.start_session_id <= %s)
-                  AND (ss.end_session_id IS NULL OR ss.end_session_id >= %s)
-                  AND (ps.start_session_id IS NULL OR ps.start_session_id <= %s)
-                  AND (ps.end_session_id IS NULL OR ps.end_session_id >= %s)
                 ORDER BY ps.id ASC
-                """, (schedule_id, session_id, session_id, session_id, session_id))
+                """, (schedule_id,))
                 eligible_staff = cursor.fetchall()
             else:
                 cursor.execute("""
@@ -122,10 +118,8 @@ class AttendanceManager:
                        phone, card_title, shift_time, is_multi_section, staff_code
                 FROM project_staff 
                 WHERE project_id = %s AND is_active = TRUE
-                  AND (start_session_id IS NULL OR start_session_id <= %s)
-                  AND (end_session_id IS NULL OR end_session_id >= %s)
                 ORDER BY id ASC
-                """, (project_id, session_id, session_id))
+                """, (project_id,))
                 eligible_staff = cursor.fetchall()
 
             for s in eligible_staff:
@@ -172,11 +166,85 @@ class AttendanceManager:
             sync_excel_sheet=sync_excel_sheet, return_details=True, end_time_str=end_time_str
         )
 
+    def ensure_session_roster_populated(self, project_id, session_id):
+        """
+        تضمین می‌کند که اگر جلسه‌ای قبل از آپلود اکسل ساخته شده باشد و لیست حضور و غیاب آن خالی باشد،
+        به محض ورود یا تغییر به آن جلسه، کادر فعال برنامه/پروژه در آن جلسه بارگذاری شود.
+        """
+        if not project_id or not session_id:
+            return
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM attendance WHERE project_id = %s AND session_id = %s",
+                (project_id, session_id)
+            )
+            cnt_row = cursor.fetchone()
+            if cnt_row and cnt_row['cnt'] > 0:
+                return
+
+            cursor.execute("SELECT schedule_id FROM sessions WHERE id = %s AND project_id = %s", (session_id, project_id))
+            sess_row = cursor.fetchone()
+            if not sess_row:
+                return
+            schedule_id = sess_row['schedule_id']
+
+            eligible_staff = []
+            if schedule_id is not None:
+                cursor.execute("""
+                SELECT ps.id, ps.name, ps.unit, ps.section, ps.position, ps.gender,
+                       ps.phone, ps.card_title, ps.shift_time, ps.is_multi_section, ps.staff_code
+                FROM schedule_staff ss
+                JOIN project_staff ps ON ss.staff_id = ps.id
+                WHERE ss.schedule_id = %s AND ss.is_active = TRUE AND ps.is_active = TRUE
+                ORDER BY ps.id ASC
+                """, (schedule_id,))
+                eligible_staff = cursor.fetchall()
+
+            # اگر پروژه فقط یک برنامه (Schedule) دارد ولی نیروها مستقیماً در project_staff ثبت شده‌اند
+            if not eligible_staff:
+                cursor.execute("SELECT COUNT(*) as sc_cnt FROM schedules WHERE project_id = %s AND is_active = TRUE", (project_id,))
+                sc_cnt = cursor.fetchone()['sc_cnt']
+                if schedule_id is None or sc_cnt <= 1:
+                    cursor.execute("""
+                    SELECT id, name, unit, section, position, gender,
+                           phone, card_title, shift_time, is_multi_section, staff_code
+                    FROM project_staff
+                    WHERE project_id = %s AND is_active = TRUE
+                    ORDER BY id ASC
+                    """, (project_id,))
+                    eligible_staff = cursor.fetchall()
+
+            if not eligible_staff:
+                return
+
+            now_iso = get_iran_now().isoformat()
+            for s in eligible_staff:
+                cursor.execute("""
+                INSERT INTO attendance (
+                    project_id, session_id, staff_id, status, card_status,
+                    staff_name_snapshot, unit_snapshot, section_snapshot, position_snapshot, gender_snapshot,
+                    phone_snapshot, card_title_snapshot, shift_time_snapshot, is_multi_section_snapshot, staff_code_snapshot,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, '', '', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(project_id, session_id, staff_id) DO NOTHING;
+                """, (
+                    project_id, session_id, s['id'],
+                    s['name'], s['unit'], s['section'], s['position'], s['gender'],
+                    s['phone'], s['card_title'], s['shift_time'], s['is_multi_section'], s['staff_code'],
+                    now_iso
+                ))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"ensure_session_roster_populated error: {e}")
+        finally:
+            conn.close()
+
     def get_auto_session_for_today(self, project_id, now=None):
-        """
-        پیدا کردن جلسه منطبق با تاریخ شمسی امروز برای یک پروژه.
-        اگر جلسه‌ای دقیقاً با تاریخ امروز وجود داشته باشد، آن را برمی‌گرداند.
-        """
+        """پیدا کردن جلسه منطبق با تاریخ شمسی امروز برای یک پروژه"""
         if now is None:
             now = get_iran_now()
         today_jalali = get_today_jalali_str(now)
@@ -188,12 +256,6 @@ class AttendanceManager:
         return None
 
     def resolve_project_active_session_id(self, project_id, now=None):
-        """
-        تعیین هوشمند جلسه فعال پروژه:
-        ۱. اگر مدیر جلسه را به صورت دستی انتخاب و قفل کرده باشد (manual_session_override=True)، همان جلسه برگردانده می‌شود.
-        ۲. در غیر این صورت، اگر جلسه‌ای منطبق با تاریخ شمسی امروز وجود داشته باشد، به طور خودکار فعال و برگردانده می‌شود.
-        ۳. اگر هیچ جلسه‌ای برای امروز نبود، آخرین جلسه فعال یا اولین جلسه برنامه‌ریزی‌شده برگردانده می‌شود.
-        """
         from project_manager import project_manager
         proj = project_manager.get_project(project_id)
         if not proj:
@@ -286,7 +348,12 @@ class AttendanceManager:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            d = dict(row)
+            if d.get('session_date'):
+                d['session_date'] = normalize_date_to_jalali(d['session_date'])
+            return d
         finally:
             conn.close()
 
@@ -305,7 +372,12 @@ class AttendanceManager:
                 WHERE project_id = %s AND name = %s
                 """, (project_id, name.strip()))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            d = dict(row)
+            if d.get('session_date'):
+                d['session_date'] = normalize_date_to_jalali(d['session_date'])
+            return d
         finally:
             conn.close()
 
@@ -319,7 +391,10 @@ class AttendanceManager:
             """, (project_id, schedule_id))
             for r in cursor.fetchall():
                 if is_same_calendar_day(r['session_date'], session_date):
-                    return dict(r)
+                    d = dict(r)
+                    if d.get('session_date'):
+                        d['session_date'] = normalize_date_to_jalali(d['session_date'])
+                    return d
             return None
         finally:
             conn.close()
@@ -338,7 +413,13 @@ class AttendanceManager:
             query += " ORDER BY id ASC"
             cursor.execute(query, params)
             rows = cursor.fetchall()
-            return [dict(r) for r in rows]
+            result = []
+            for r in rows:
+                d = dict(r)
+                if d.get('session_date'):
+                    d['session_date'] = normalize_date_to_jalali(d['session_date'])
+                result.append(d)
+            return result
         finally:
             conn.close()
 
@@ -428,6 +509,10 @@ class AttendanceManager:
     def get_session_attendance(self, project_id, session_id):
         if not session_id:
             return []
+
+        # اطمینان از اینکه اگر جلسه جدید/دیگری انتخاب شده که هنوز جدول حضور و غیابش پر نشده، خودکار از کادر پروژه پر شود
+        self.ensure_session_roster_populated(project_id, session_id)
+
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()
@@ -485,6 +570,7 @@ class AttendanceManager:
     def get_staff_session_attendance(self, project_id, session_id, staff_id):
         if not session_id:
             return None
+        self.ensure_session_roster_populated(project_id, session_id)
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()
